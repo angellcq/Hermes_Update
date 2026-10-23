@@ -1,0 +1,43 @@
+Hermes Installer
+================
+
+This project is an unofficial, community-maintained installer wrapper for
+Hermes Agent. It is not affiliated with, endorsed by, or sponsored by
+Nous Research.
+
+This tool does not redistribute Hermes Agent or Electron. At runtime it
+downloads and drives the official Hermes installer and uses the installed
+Hermes CLI. The following third-party projects are used or downloaded:
+
+  Hermes Agent
+    Project: https://github.com/NousResearch/hermes-agent
+    License: MIT
+    Copyright (c) Nous Research
+
+  Electron
+    Project: https://github.com/electron/electron
+    License: MIT
+    Copyright (c) Electron contributors / OpenJS Foundation
+
+  electron-builder
+    Project: https://github.com/electron-userland/electron-builder
+    License: MIT
+
+  uv (Astral)
+    Project: https://github.com/astral-sh/uv
+    License: MIT OR Apache-2.0
+
+  .NET Framework / WinForms
+    Microsoft Corporation, subject to the Microsoft .NET Framework license.
+
+Mirror endpoints used by default (not owned by this project):
+
+  https://hermes-agent.nousresearch.com/   (official)
+  https://ghproxy.net/                     (git proxy)
+  https://npmmirror.com/                   (Electron / npm mirrors)
+  https://pypi.tuna.tsinghua.edu.cn/       (PyPI mirror)
+
+The hosts workaround is opt-in, requires administrator approval, backs up the
+existing hosts file, and can be reverted from the application.
+
+This project is released under the Apache License 2.0; see LICENSE.
