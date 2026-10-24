@@ -347,10 +347,13 @@ public sealed class ServiceStateGuard
 
 **`QueryGatewayPidAsync` 规格**
 
-- 执行 `& "<HermesCmd>" gateway status`（`OperationClass.EndpointProbe`，5 s 总超时，不重试）。
+- 执行 `& "<HermesCmd>" gateway status`。
+- **超时类别：`OperationClass.Generic` 的定制实例（NoProgressTimeout=120s / TotalTimeout=300s），不得用 `EndpointProbe`。**
+  > **2026-10-24 实测修正（R-12）**：本 DD 初稿写的「EndpointProbe，5 s 总超时」是错的——`hermes gateway status` 实测单次耗时 **5.7 秒**（PowerShell 启动 + CLI 加载 + 查计划任务），5 秒必然超时。后果：`CaptureAsync` 永远得到 `HadGateway=false`，A4 判「升级前未运行，无需恢复」→ **假通过**，恰是 PRD 要消除的缺陷。该错误由 T-HU-DEV-3 首轮实现照抄 DD 而暴露，已在 R-12 记录并修正。
 - 返回 `stdout` 原文（**必须整段写日志**，R-03 要求）。
 - 解析规则：逐行找同时含 `Gateway process running` 与 `PID:` 的行，取 `PID:` 后的连续数字。解析失败 → 返回 0。
 - 若 `stdout` 含 `Gateway process not running` 或 PID=0 → 视为未运行。
+- `ensure` / `start` 两个启动命令沿用同一套超时选项（120s 无进展 / 300s 总超时）。
 
 **`RestoreAsync` 伪代码**
 
