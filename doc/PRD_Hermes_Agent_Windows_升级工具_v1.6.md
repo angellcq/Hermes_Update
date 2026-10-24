@@ -590,15 +590,16 @@ D2 拍板「先用第 1 张 DEV 卡跑通 S1→S7 全链路，再铺开」，建
 M2 范围（D1=A 之后第二个里程碑，PRD §7）：**6 条 FR** —— FR-1.4 / FR-1.5 / FR-4.1 / FR-4.2 / FR-4.3 / FR-4.4。
 
 > 锚点口径：每条都跑过 grep 计数，凡写「0 处」即全项目搜不到该实现，属**从零建设**且不是「已经做了但没发现」。
+> **S3 已回填**（2026-10-24）：HLD/DD/任务卡/验证项四栏由 `doc/HLD_Hermes_Agent_Windows_升级工具_M2_v1.0.md` 与 `doc/DD_Hermes_Agent_Windows_升级工具_M2_v1.0.md` 映射完成，6 条 FR 状态均为「设计完成」。
 
 | 需求编号 | 需求摘要 | 现状锚点（实测） | 验收 | HLD | DD | 任务卡 | 验证项 | 状态 |
 |---|---|---|---|---|---|---|---|---|
-| FR-1.4 | 依赖下载去重与缓存：uv/npm 持久缓存 + 按 lock 内 sha256 / npm integrity 校验后复用 | 唯一缓存目录是 `NetworkPreparer.cs:36` 的 `ELECTRON_BUILDER_CACHE`；**`UV_CACHE_DIR` 0 处、npm cache（`npm_config_cache`/`NPM_CONFIG_CACHE`）0 处、`integrity` 0 处**；全项目唯一 `SHA256.Create` 在 `VersionFingerprint.cs:193`（算 `pm/lock.json` 指纹，不是下载校验） | AC-06 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
-| FR-1.5 | git 依赖镜像化：`git+https://github.com/...` 依赖重写为镜像前缀 + 单独连通性探测 | `NetworkPreparer.cs:33` 只注入 `HERMES_REPO_URL`（覆盖主仓）；**`GIT_CONFIG_COUNT` 0 处、`insteadOf` 0 处** → git 依赖仍直连 `github.com`（即云正事 E14 的 `misaki`/`psutil` 21s 超时 ×3） | AC-07 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
-| FR-4.1 | 分级定义 L0/L1/L2（L3 不做，见 D-08） | `Models.cs:74-82` `NetworkEndpoint` 仅六字段（Id/Name/Category/Url/Kind/Critical），**无 Level / Weight 字段（0 处）**；`Mirrors.cs:32-55` `BuildEndpoints()` 平铺 11 个端点无层级归属；**`Mirrors.cs:27` `RepoCandidates[0]` 是 `ghproxy.net`（镜像优先，与 FR-4.1「L0 首选」直接冲突，见 D-11）** | AC-28、AC-30 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
-| FR-4.2 | 切换判据：本级失败/不稳定判定、配额、冷却、回试 | `NetworkProbe.cs:98-143` `ProbeOneAsync` 只取 HTTP 状态码，**无速率测量（`rate`/`KB/s` 0 处）**；`:110` 超时固定 22s(git)/12s(http)；`:37-96` `RunAsync` 一次性探测全部端点后由 `Pick*` 选一个，**探测结果一旦选定即不再变化（无运行期切换）**；`InstallerEngine.cs:276-281` 升级只调一次 `RunPowerShellAsync`，失败在 `:287-291` 直接抛异常，**无换源重试** | AC-34 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
-| FR-4.3 | 切换日志：每次切级一条 `[NET]` 结构化行，含原因/端点/耗时/速率 | **`[NET]` 全项目 0 处**；`NetworkProbe.cs:87-91` 打的是中文自然语言 `网络检测 xxx 可用 355ms HTTP 200`，字段不可机读 | AC-27 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
-| FR-4.4 | 完整性校验：git 校验 commit/tag、raw 与 ZIP 校验长度 + sha256、失败切换下一级 | `InstallerEngine.cs:184` 下载 `install.ps1` 仅做 `bytes.Length < 10000` 下限检查，**无 sha256**；`Mirrors.cs` 无任何 checksum 常量 | AC-28 | 待填 | 待填 | 待填 | 待填 | 未覆盖 |
+| FR-1.4 | 依赖下载去重与缓存：uv/npm 持久缓存 + 按 lock 内 sha256 / npm integrity 校验后复用 | 唯一缓存目录是 `NetworkPreparer.cs:36` 的 `ELECTRON_BUILDER_CACHE`；**`UV_CACHE_DIR` 0 处、npm cache（`npm_config_cache`/`NPM_CONFIG_CACHE`）0 处、`integrity` 0 处**；全项目唯一 `SHA256.Create` 在 `VersionFingerprint.cs:193`（算 `pm/lock.json` 指纹，不是下载校验） | AC-06 | HLD-M2 §2.3 G4 | DD-M2 §2.2 G4（+UV_CACHE_DIR / npm cache） | T-HU2-DEV-2 | AC-06 **部分**（缓存目录被使用） | 设计完成 |
+| FR-1.5 | git 依赖镜像化：`git+https://github.com/...` 依赖重写为镜像前缀 + 单独连通性探测 | `NetworkPreparer.cs:33` 只注入 `HERMES_REPO_URL`（覆盖主仓）；**`GIT_CONFIG_COUNT` 0 处、`insteadOf` 0 处** → git 依赖仍直连 `github.com`（即云正事 E14 的 `misaki`/`psutil` 21s 超时 ×3） | AC-07 | HLD-M2 §2.3 G4 | DD-M2 §2.2 G4（GIT_CONFIG_COUNT 注入） | T-HU2-DEV-2 | AC-07 git ls-remote 输出镜像地址 | 设计完成 |
+| FR-4.1 | 分级定义 L0/L1/L2（L3 不做，见 D-08） | `Models.cs:74-82` `NetworkEndpoint` 仅六字段（Id/Name/Category/Url/Kind/Critical），**无 Level / Weight 字段（0 处）**；`Mirrors.cs:32-55` `BuildEndpoints()` 平铺 11 个端点无层级归属；**`Mirrors.cs:27` `RepoCandidates[0]` 是 `ghproxy.net`（镜像优先，与 FR-4.1「L0 首选」直接冲突，见 D-11）** | AC-28、AC-30 | HLD-M2 §2.3 G1+G3 | DD-M2 §2.2 G1+G3（9 组分级模型） | T-HU2-DEV-1 | AC-30 来源域名记录 | 设计完成 |
+| FR-4.2 | 切换判据：本级失败/不稳定判定、配额、冷却、回试 | `NetworkProbe.cs:98-143` `ProbeOneAsync` 只取 HTTP 状态码，**无速率测量（`rate`/`KB/s` 0 处）**；`:110` 超时固定 22s(git)/12s(http)；`:37-96` `RunAsync` 一次性探测全部端点后由 `Pick*` 选一个，**探测结果一旦选定即不再变化（无运行期切换）**；`InstallerEngine.cs:276-281` 升级只调一次 `RunPowerShellAsync`，失败在 `:287-291` 直接抛异常，**无换源重试** | AC-34 | HLD-M2 §2.3 G1+G6 | DD-M2 §2.2 G1+G5+G6（命令级切级） | T-HU2-DEV-1/3/5 | AC-34 **部分**（见 DD-M2 §6.3） | 设计完成 |
+| FR-4.3 | 切换日志：每次切级一条 `[NET]` 结构化行，含原因/端点/耗时/速率 | **`[NET]` 全项目 0 处**；`NetworkProbe.cs:87-91` 打的是中文自然语言 `网络检测 xxx 可用 355ms HTTP 200`，字段不可机读 | AC-27 | HLD-M2 §2.3 G1 | DD-M2 §2.2 G1 FormatNetLine（格式冻结） | T-HU2-DEV-1 | AC-27 切级日志逐字段断言 | 设计完成 |
+| FR-4.4 | 完整性校验：git 校验 commit/tag、raw 与 ZIP 校验长度 + sha256、失败切换下一级 | `InstallerEngine.cs:184` 下载 `install.ps1` 仅做 `bytes.Length < 10000` 下限检查，**无 sha256**；`Mirrors.cs` 无任何 checksum 常量 | AC-28 | HLD-M2 §2.3 G2 | DD-M2 §2.2 G2（双源交叉校验） | T-HU2-DEV-4 | AC-28 双源不一致即抛异常 | 设计完成 |
 
 ## 9.6 M2 技术硬边界（实测得出，设计不得越过）
 
