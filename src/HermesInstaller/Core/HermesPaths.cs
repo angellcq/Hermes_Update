@@ -57,6 +57,12 @@ namespace HermesInstaller.Core
         public static string SettingsPath { get { return Path.Combine(AppDataDir, "settings.json"); } }
         public static string LogDirectory { get { return Path.Combine(AppDataDir, "logs"); } }
 
+        // G9（T-HU-DEV-3）：本工具自己的运行状态目录，不耐 Hermes 安装根。
+        public static string StateDir { get { return Path.Combine(AppDataDir, "state"); } }
+        public static string FingerprintPath { get { return Path.Combine(StateDir, "fingerprint.json"); } }
+        public static string RunStatePath { get { return Path.Combine(StateDir, "run.json"); } }
+        public static string ServiceSnapshotPath { get { return Path.Combine(StateDir, "service-snapshot.json"); } }
+
         public static bool InstallLooksPresent
         {
             get { return Directory.Exists(InstallDir) && File.Exists(Path.Combine(InstallDir, ".git")); }
@@ -85,6 +91,7 @@ namespace HermesInstaller.Core
             Directory.CreateDirectory(AppDataDir);
             Directory.CreateDirectory(CacheDir);
             Directory.CreateDirectory(LogDirectory);
+            Directory.CreateDirectory(StateDir);
         }
     }
 }

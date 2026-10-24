@@ -25,6 +25,8 @@ namespace HermesInstaller.Core
         private readonly Logger _logger;
         private readonly ProcessRunner _runner;
         private readonly NetworkPreparer _network;
+        private readonly ResultVerifier _verifier;
+        private readonly ServiceStateGuard _serviceGuard;
 
         public InstallerEngine(Settings settings, Logger logger)
         {
@@ -32,6 +34,8 @@ namespace HermesInstaller.Core
             _logger = logger;
             _runner = new ProcessRunner();
             _network = new NetworkPreparer(_settings, logger);
+            _verifier = new ResultVerifier(logger, this);
+            _serviceGuard = new ServiceStateGuard(logger, _runner);
         }
 
         public string InstallerScriptPath { get { return HermesPaths.CachedInstallerScript; } }
@@ -53,8 +57,12 @@ namespace HermesInstaller.Core
         {
             try
             {
+                DateTime startedAt = DateTime.Now;
                 Report(progress, 0, 1, "准备", "正在获取官方安装脚本…", false);
                 await DownloadInstallerScriptAsync(cancellationToken).ConfigureAwait(false);
+
+                // A2 前值预检（冻结口径，DD 偏差 D-4）：在阶段执行（可能重装 python）之前采样。
+                bool? preCheckOk = await _verifier.PreCheckDependenciesAsync(cancellationToken).ConfigureAwait(false);
 
                 _logger.Stage("读取安装阶段清单…");
                 InstallManifest manifest = await GetManifestAsync(includeDesktop, cancellationToken).ConfigureAwait(false);
@@ -82,10 +90,11 @@ namespace HermesInstaller.Core
                         result.Skipped ? "已跳过: " + stage.Title : "完成: " + stage.Title, false);
                 }
 
-                _logger.Success("安装流程结束。");
-                return OperationResult.Ok(
-                    includeDesktop ? "Hermes CLI + 桌面端安装完成。" : "Hermes CLI 安装完成。",
-                    _logger.LogPath);
+                VerificationReport report = await _verifier.VerifyAsync(
+                    includeDesktop, null, null, startedAt, cancellationToken, preCheckOk).ConfigureAwait(false);
+                Report(progress, 1, 1, "自检", report.Summary, false);
+
+                return ConcludeResult(report, "安装", _logger.LogPath);
             }
             catch (OperationCanceledException)
             {
@@ -260,12 +269,21 @@ namespace HermesInstaller.Core
         {
             try
             {
+                DateTime startedAt = DateTime.Now;
                 if (!HermesPaths.CliLauncherPresent)
                 {
                     throw new InstallerException("未检测到 Hermes CLI，请先执行「新装」。");
                 }
 
                 _logger.Stage("停止运行中的 Hermes 进程…");
+
+                // A2 前值预检（冻结口径，DD 偏差 D-4）：必须在停进程/动文件之前采样。
+                bool? preCheckOk = await _verifier.PreCheckDependenciesAsync(cancellationToken).ConfigureAwait(false);
+
+                // G5（T-HU-DEV-3）：停进程之前先把网关/桌面端状态拍成基线快照。
+                // 日志证据 E2：升级停进程后网关无人拉起；基线必须在 Stop 之前采集才有意义。
+                ServiceSnapshot serviceBaseline = await _serviceGuard.CaptureAsync(cancellationToken).ConfigureAwait(false);
+
                 await StopHermesProcessesAsync(cancellationToken).ConfigureAwait(false);
 
                 Report(progress, 0, 1, "升级", "正在执行 hermes update…", true);
@@ -273,12 +291,14 @@ namespace HermesInstaller.Core
                 string invocation = "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " update --yes" +
                                     (_settings.BackupBeforeUpdate ? " --backup" : string.Empty);
 
+                // G8 改造点 3：升级预算走 OperationBudget（1500s 总 / 180s 无进展），不再裸跑。
                 ProcessResult result = await _runner.RunPowerShellAsync(
                     invocation,
                     HermesPaths.HermesHome,
                     env,
                     (line, level) => _logger.Write(level, line),
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    RetryPolicy.For(OperationClass.OperationBudget)).ConfigureAwait(false);
 
                 if (result.Cancelled)
                 {
@@ -290,32 +310,37 @@ namespace HermesInstaller.Core
                         Truncate(result.StandardError, 300));
                 }
 
-                if (includeDesktop)
+                if (includeDesktop && !HermesPaths.DesktopBuilt)
                 {
-                    if (!HermesPaths.DesktopBuilt)
+                    _logger.Warn("未找到桌面端产物，单独重建…");
+                    Report(progress, 0, 1, "桌面端", "正在重建桌面端…", true);
+                    ProcessResult build = await _runner.RunPowerShellAsync(
+                        "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " desktop --build-only --force-build",
+                        HermesPaths.HermesHome,
+                        env,
+                        (line, level) => _logger.Write(level, line),
+                        cancellationToken).ConfigureAwait(false);
+                    if (build.ExitCode != 0 || !HermesPaths.DesktopBuilt)
                     {
-                        _logger.Warn("未找到桌面端产物，单独重建…");
-                        Report(progress, 0, 1, "桌面端", "正在重建桌面端…", true);
-                        ProcessResult build = await _runner.RunPowerShellAsync(
-                            "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " desktop --build-only --force-build",
-                            HermesPaths.HermesHome,
-                            env,
-                            (line, level) => _logger.Write(level, line),
-                            cancellationToken).ConfigureAwait(false);
-                        if (build.ExitCode != 0 || !HermesPaths.DesktopBuilt)
-                        {
-                            throw new InstallerException("桌面端重建失败。请查看日志。");
-                        }
-                    }
-                    else
-                    {
-                        _logger.Success("桌面端已随更新重建。");
+                        throw new InstallerException("桌面端重建失败。请查看日志。");
                     }
                 }
 
-                Report(progress, 1, 1, "升级", "升级完成", false);
-                _logger.Success("升级完成。");
-                return OperationResult.Ok("升级完成。", _logger.LogPath);
+                // G5 流程 ⑨：升级收尾按冻结顺序复原网关（ensure → start → 失败降级），
+                // 双起防护保证网关已在跑时不再发起任何启动命令。
+                ServiceRestoreResult restore = await _serviceGuard.RestoreAsync(
+                    serviceBaseline, cancellationToken).ConfigureAwait(false);
+                _logger.Info("[GATEWAY] 复原结论：Restored=" + restore.Restored
+                    + "，Detail=" + restore.Detail
+                    + "，PidBefore=" + restore.PidBefore + "，PidAfter=" + restore.PidAfter);
+
+                // G5 流程 ⑩（A4 联动）：真实 baseline/restore 传入，A4 不再 Skipped。
+                VerificationReport report = await _verifier.VerifyAsync(
+                    includeDesktop, serviceBaseline, restore,
+                    startedAt, cancellationToken, preCheckOk).ConfigureAwait(false);
+                Report(progress, 1, 1, "升级", report.Summary, false);
+
+                return ConcludeResult(report, "升级", _logger.LogPath);
             }
             catch (OperationCanceledException)
             {
@@ -377,6 +402,31 @@ namespace HermesInstaller.Core
 
         // ---------------------------------------------------------------- helpers
 
+        /// <summary>
+        /// G8 改造点 7/8 的统一收尾（流程 ⑪）：把 VerificationReport 合成三态 OperationResult。
+        /// Success → Ok；Degraded → Degrade；Failed → Error。断言行已由 ResultVerifier 逐条落日志。
+        /// </summary>
+        private static OperationResult ConcludeResult(VerificationReport report, string operationName, string logPath)
+        {
+            string title = UiTextBuilder.OutcomeTitle(report.Outcome, operationName);
+            string message = title + "：" + report.Summary;
+            OperationResult result;
+            switch (report.Outcome)
+            {
+                case OperationOutcome.Degraded:
+                    result = OperationResult.Degrade(message, logPath);
+                    break;
+                case OperationOutcome.Success:
+                    result = OperationResult.Ok(message, logPath);
+                    break;
+                default:
+                    result = OperationResult.Error(message, logPath);
+                    break;
+            }
+            result.Verification = report;
+            return result;
+        }
+
         public async Task<string> GetVersionAsync(CancellationToken cancellationToken)
         {
             if (!HermesPaths.CliLauncherPresent)
@@ -407,7 +457,52 @@ namespace HermesInstaller.Core
 
         public async Task StopHermesProcessesAsync(CancellationToken cancellationToken)
         {
-            string home = HermesPaths.HermesHome.TrimEnd('\\') + "\\";
+            // G8 改造点 9：旧行为等价——以单根构造列表转调新重载。
+            var homes = new List<string>();
+            homes.Add(HermesPaths.HermesHome);
+            await StopHermesProcessesAsync(homes, true, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// G8 改造点 9：按根集合停止进程。selectedOnly=true 时仅停「选中根」的进程。
+        /// 保留既有正确部分：跳过自身、Kill 失败回落 KillTree、杀完延时 1500ms。
+        /// </summary>
+        public async Task StopHermesProcessesAsync(
+            IList<string> homes, bool selectedOnly, CancellationToken cancellationToken)
+        {
+            // 归一化：TrimEnd + OrdinalIgnoreCase 去重（与 HomeRegistry 口径一致）。
+            var roots = new List<string>();
+            foreach (string home in (homes ?? new List<string>()))
+            {
+                if (string.IsNullOrWhiteSpace(home))
+                {
+                    continue;
+                }
+                string normalized = home.TrimEnd('\\');
+                bool exists = false;
+                foreach (string seen in roots)
+                {
+                    if (string.Equals(seen, normalized, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                {
+                    roots.Add(normalized);
+                }
+            }
+
+            if (selectedOnly)
+            {
+                string selected = HermesPaths.HermesHome.TrimEnd('\\');
+                roots.RemoveAll(delegate(string r)
+                {
+                    return !string.Equals(r, selected, StringComparison.OrdinalIgnoreCase);
+                });
+            }
+
             var killed = new List<string>();
 
             foreach (string name in new[] { "Hermes", "hermes", "python", "pythonw" })
@@ -418,7 +513,19 @@ namespace HermesInstaller.Core
                     {
                         string path = null;
                         try { path = process.MainModule != null ? process.MainModule.FileName : null; } catch { }
-                        if (path == null || !path.StartsWith(home, StringComparison.OrdinalIgnoreCase))
+                        bool owned = false;
+                        if (path != null)
+                        {
+                            foreach (string root in roots)
+                            {
+                                if (path.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    owned = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!owned)
                         {
                             continue;
                         }
