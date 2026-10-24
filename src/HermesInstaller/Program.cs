@@ -41,7 +41,9 @@ namespace HermesInstaller
             {
                 if (!createdNew)
                 {
-                    MessageBox.Show("Hermes 安装助手已经在运行。", "Hermes 安装助手",
+                    // G6/G10（T-HU-DEV-4）：锁被占时若另一实例确在执行，附上操作/阶段/时长提示。
+                    string extra = HermesInstaller.Core.UiTextBuilder.OtherInstanceText(HermesInstaller.Core.RunStateStore.ReadOtherStaleTolerant());
+                    MessageBox.Show("Hermes 安装助手已经在运行。" + extra, "Hermes 安装助手",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }

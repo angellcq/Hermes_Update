@@ -65,7 +65,16 @@ namespace HermesInstaller.Core
 
         public static bool InstallLooksPresent
         {
-            get { return Directory.Exists(InstallDir) && File.Exists(Path.Combine(InstallDir, ".git")); }
+            // .git 通常是目录，但 git worktree / submodule 场景下是文件——两者都算存在。
+            get
+            {
+                if (!Directory.Exists(InstallDir))
+                {
+                    return false;
+                }
+                string dotGit = Path.Combine(InstallDir, ".git");
+                return Directory.Exists(dotGit) || File.Exists(dotGit);
+            }
         }
 
         public static bool CliLauncherPresent

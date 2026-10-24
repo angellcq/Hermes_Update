@@ -861,9 +861,11 @@ namespace HermesInstaller
                         break;
                     case OperationKind.CliUpgrade:
                         result = await engine.RunUpgradeAsync(false, progress, _cts.Token);
+                        engine.ReportRunStage("CLI 升级结束");
                         break;
                     case OperationKind.DesktopUpgrade:
                         result = await engine.RunUpgradeAsync(true, progress, _cts.Token);
+                        engine.ReportRunStage("桌面端升级结束");
                         break;
                     case OperationKind.CliUninstall:
                         result = await engine.RunUninstallAsync(progress, _cts.Token);
@@ -885,6 +887,8 @@ namespace HermesInstaller
             }
             finally
             {
+                // G6（T-HU-DEV-4）：所有操作路径收尾都要清掉 run.json（含取消/异常）。
+                InstallerEngine.ClearRunState();
                 _busy = false;
                 SetBusy(false);
                 if (_cts != null)

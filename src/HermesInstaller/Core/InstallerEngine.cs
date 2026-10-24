@@ -27,6 +27,7 @@ namespace HermesInstaller.Core
         private readonly NetworkPreparer _network;
         private readonly ResultVerifier _verifier;
         private readonly ServiceStateGuard _serviceGuard;
+        private readonly RunStateStore _runState;
 
         public InstallerEngine(Settings settings, Logger logger)
         {
@@ -36,9 +37,55 @@ namespace HermesInstaller.Core
             _network = new NetworkPreparer(_settings, logger);
             _verifier = new ResultVerifier(logger, this);
             _serviceGuard = new ServiceStateGuard(logger, _runner);
+            _runState = new RunStateStore(logger);
         }
 
         public string InstallerScriptPath { get { return HermesPaths.CachedInstallerScript; } }
+
+        /// <summary>
+        /// G6（T-HU-DEV-4）：沿用既有的「阶段名」口径写 run.json 的 stageName。
+        /// RunOperationAsync 的 Report(progress,...) 已带标题；这里只做状态登记的镜像。
+        /// </summary>
+        public void ReportRunStage(string stageName)
+        {
+            try { _runState.UpdateStage(stageName); }
+            catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// G6（T-HU-DEV-4）：静态清理收口。MainForm 侧无论引擎是否被构造都强制清，
+        /// 兜住 Engine 有崩溃未执行自身 finally 的情形。文件不存在则无事发生，异常按 Warn 落日志、不抛。
+        /// </summary>
+        public static void ClearRunState()
+        {
+            try
+            {
+                if (File.Exists(HermesPaths.RunStatePath))
+                {
+                    File.Delete(HermesPaths.RunStatePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                WarnStatic("[STATE] 清理 run.json 失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>静态路径（ClearRunState / ReadOtherStaleTolerant）的日志出口（R-03 不静默红线）。</summary>
+        private static void WarnStatic(string message)
+        {
+            try
+            {
+                using (var logger = new Logger())
+                {
+                    logger.Warn(message);
+                }
+            }
+            catch
+            {
+                // 日志器本身不可用时只能放弃，不影响调用方主流程。
+            }
+        }
 
         /// <summary>Downloads the official script and returns its stage manifest (used by self-test).</summary>
         public async Task<InstallManifest> ProbeManifestAsync(CancellationToken cancellationToken)
@@ -58,6 +105,11 @@ namespace HermesInstaller.Core
             try
             {
                 DateTime startedAt = DateTime.Now;
+                try { _runState.Begin("安装"); }
+                catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
+                try { _runState.UpdateStage("获取安装脚本"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+
                 Report(progress, 0, 1, "准备", "正在获取官方安装脚本…", false);
                 await DownloadInstallerScriptAsync(cancellationToken).ConfigureAwait(false);
 
@@ -78,6 +130,10 @@ namespace HermesInstaller.Core
                     ManifestStage stage = manifest.Stages[i];
                     Report(progress, i + 1, total, stage.Title, "正在执行: " + stage.Title, true);
                     _logger.Stage(string.Format("[{0}/{1}] {2}", i + 1, total, stage.Title));
+
+                    // G6（T-HU-DEV-4）：阶段切换即刷新 run.json 的 stageName（顺带刷新心跳）。
+                    try { _runState.UpdateStage(stage.Title); }
+                    catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
 
                     StageResult result = await RunStageAsync(stage.Name, includeDesktop, cancellationToken).ConfigureAwait(false);
                     if (!result.Ok)
@@ -108,6 +164,7 @@ namespace HermesInstaller.Core
             }
             finally
             {
+                _runState.Clear();
                 AppendHermesLogs();
             }
         }
@@ -270,6 +327,8 @@ namespace HermesInstaller.Core
             try
             {
                 DateTime startedAt = DateTime.Now;
+                try { _runState.Begin("升级"); }
+                catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
                 if (!HermesPaths.CliLauncherPresent)
                 {
                     throw new InstallerException("未检测到 Hermes CLI，请先执行「新装」。");
@@ -286,6 +345,17 @@ namespace HermesInstaller.Core
 
                 await StopHermesProcessesAsync(cancellationToken).ConfigureAwait(false);
 
+                // G3（T-HU-DEV-4）：本轮操作内的防重复指纹（DD §2.2 G3，口径红线见偏差 D-1）。
+                // fpBefore 在停进程后、update 前取；fpAfter 在 update 返回后取（无论是否含桌面端）；
+                // IsSame 只用于本次调用内判定「update 是否产生了版本变化」，绝不跨会话使用。
+                try { _runState.UpdateStage("指纹采集（升级前）"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+                var fingerprint = new VersionFingerprint(_logger, _runner, this);
+                FingerprintRecord fpBefore = await fingerprint.CaptureAsync(cancellationToken).ConfigureAwait(false);
+                fingerprint.SaveLast(fpBefore);
+
+                try { _runState.UpdateStage("hermes update"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                 Report(progress, 0, 1, "升级", "正在执行 hermes update…", true);
                 var env = _network.BuildEnvironment();
                 string invocation = "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " update --yes" +
@@ -310,9 +380,24 @@ namespace HermesInstaller.Core
                         Truncate(result.StandardError, 300));
                 }
 
-                if (includeDesktop && !HermesPaths.DesktopBuilt)
+                // G3 防重复判定（同一次操作内）：无版本变化则跳过桌面端重建，杜绝 E3/E15 的
+                // 「同一轮升级跑两遍 update/重建」。该判定不落盘、不保留到下一轮——
+                // LoadLast 的结果在这里不会被用来提前 return，升级命令每轮都实际执行（D-1）。
+                FingerprintRecord fpAfter = await fingerprint.CaptureAsync(cancellationToken).ConfigureAwait(false);
+                fingerprint.SaveLast(fpAfter);
+                bool versionUnchanged = VersionFingerprint.IsSame(fpBefore, fpAfter);
+                _logger.Info("[FP] 指纹判等结论: unchanged=" + versionUnchanged
+                    + "（IsSame 仅限本轮操作内比较，跨会话不做指纹跳过——DD 偏差 D-1）");
+                _logger.Info(UiTextBuilder.FingerprintChangedText(versionUnchanged));
+
+                // G8 改造点 5：二次构建条件 = !DesktopBuilt（既有）「或」产物 mtime 未随本轮更新；
+                // 且本轮 update 已无版本变化时不再发起重建（G3 防重复）。
+                if (includeDesktop && !versionUnchanged
+                    && (!HermesPaths.DesktopBuilt || !IsDesktopArtifactFresh(startedAt)))
                 {
-                    _logger.Warn("未找到桌面端产物，单独重建…");
+                    _logger.Warn("未找到桌面端产物（或产物早于本轮开始时间），单独重建…");
+                    try { _runState.UpdateStage("桌面端重建"); }
+                    catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                     Report(progress, 0, 1, "桌面端", "正在重建桌面端…", true);
                     ProcessResult build = await _runner.RunPowerShellAsync(
                         "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " desktop --build-only --force-build",
@@ -328,6 +413,8 @@ namespace HermesInstaller.Core
 
                 // G5 流程 ⑨：升级收尾按冻结顺序复原网关（ensure → start → 失败降级），
                 // 双起防护保证网关已在跑时不再发起任何启动命令。
+                try { _runState.UpdateStage("网关复原"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                 ServiceRestoreResult restore = await _serviceGuard.RestoreAsync(
                     serviceBaseline, cancellationToken).ConfigureAwait(false);
                 _logger.Info("[GATEWAY] 复原结论：Restored=" + restore.Restored
@@ -354,6 +441,7 @@ namespace HermesInstaller.Core
             }
             finally
             {
+                _runState.Clear();
                 AppendHermesLogs();
             }
         }
@@ -369,6 +457,10 @@ namespace HermesInstaller.Core
                     throw new InstallerException("未检测到 Hermes CLI。");
                 }
                 await StopHermesProcessesAsync(cancellationToken).ConfigureAwait(false);
+                try { _runState.Begin("卸载"); }
+                catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
+                try { _runState.UpdateStage("正在卸载"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                 Report(progress, 0, 1, "卸载", "正在卸载（保留用户数据）…", true);
 
                 ProcessResult result = await _runner.RunPowerShellAsync(
@@ -396,11 +488,34 @@ namespace HermesInstaller.Core
             }
             finally
             {
+                _runState.Clear();
                 AppendHermesLogs();
             }
         }
 
         // ---------------------------------------------------------------- helpers
+
+        /// <summary>
+        /// G8 改造点 5：桌面端产物是否在本轮开始之后被更新过（mtime 粒度按文件系统 2s 内不比较）。
+        /// 产物存在且 mtime 已大于 startedAt → 视为 update 刚重建过，无需再补一枪 build-only。
+        /// </summary>
+        private bool IsDesktopArtifactFresh(DateTime startedAt)
+        {
+            try
+            {
+                if (!HermesPaths.DesktopBuilt)
+                {
+                    return false;
+                }
+                DateTime mtime = File.GetLastWriteTime(HermesPaths.DesktopExe);
+                return mtime > startedAt.AddSeconds(-2);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[G8] 读取桌面端产物 mtime 失败，按「产物未更新」处理: " + ex.Message);
+                return false;
+            }
+        }
 
         /// <summary>
         /// G8 改造点 7/8 的统一收尾（流程 ⑪）：把 VerificationReport 合成三态 OperationResult。

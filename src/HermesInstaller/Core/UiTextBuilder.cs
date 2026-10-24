@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace HermesInstaller.Core
 {
@@ -99,6 +100,46 @@ namespace HermesInstaller.Core
             }
             lines.Add(VerificationSummary(report));
             return lines;
+        }
+
+        /// <summary>
+        /// 双实例提示文案（DD §2.2 G10 冻结口径）：
+        /// "另一实例正在执行：&lt;操作&gt;／阶段 &lt;阶段&gt;／已进行 &lt;n&gt; 分"。
+        /// 字段缺失时逐项降级为「未知」，保证弹窗至少带上这句前缀。
+        /// </summary>
+        public static string OtherInstanceText(RunStateRecord rec)
+        {
+            if (rec == null)
+            {
+                return string.Empty;
+            }
+            string operation = string.IsNullOrWhiteSpace(rec.Operation) ? "未知操作" : rec.Operation.Trim();
+            string stage = string.IsNullOrWhiteSpace(rec.StageName) ? "未知" : rec.StageName.Trim();
+            int minutes = 0;
+            if (!string.IsNullOrEmpty(rec.StartedAt))
+            {
+                DateTime started;
+                if (DateTime.TryParseExact(rec.StartedAt, "yyyy-MM-dd HH:mm:ss",
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out started))
+                {
+                    minutes = (int)Math.Floor((DateTime.Now - started).TotalMinutes);
+                    if (minutes < 0)
+                    {
+                        minutes = 0;
+                    }
+                }
+            }
+            return "\r\n\r\n【G6】另一实例正在执行：" + operation
+                + "／阶段 " + stage
+                + "／已进行 " + minutes.ToString(CultureInfo.InvariantCulture) + " 分";
+        }
+
+        /// <summary>指纹防重复命中的日志行（G3，D-1 口径：只解释本轮，不涉及跨会话）。</summary>
+        public static string FingerprintChangedText(bool unchanged)
+        {
+            return unchanged
+                ? "【G3】本轮版本指纹未变化，同一操作内不重复执行升级/重建步骤。"
+                : "【G3】本轮版本指纹已变化（不同会话不做指纹判等，正常执行升级）。";
         }
     }
 }
