@@ -896,12 +896,20 @@ namespace HermesInstaller
 
             if (result != null)
             {
-                AppendLog(result.Success ? LogLevel.Success : LogLevel.Error, result.Message);
+                LogLevel level = AppendVerification(result);
+                AppendLog(level, result.Message);
                 lblProgress.Text = result.Message;
+                MessageBoxIcon icon;
+                switch (result.Outcome)
+                {
+                    case OperationOutcome.Success: icon = MessageBoxIcon.Information; break;
+                    case OperationOutcome.Degraded: icon = MessageBoxIcon.Warning; break;
+                    default: icon = MessageBoxIcon.Error; break;
+                }
                 MessageBox.Show(this, result.Message + (string.IsNullOrEmpty(result.LogPath) ? "" : "\r\n\r\n日志: " + result.LogPath),
                     "Hermes 安装助手",
                     MessageBoxButtons.OK,
-                    result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    icon);
 
                 if (!result.Success && LooksLikeNetworkFailure(result.Message))
                 {
@@ -910,6 +918,26 @@ namespace HermesInstaller
             }
 
             await RefreshEnvironmentAsync();
+        }
+
+        /// <summary>补写断言汇总行（逐条断言已由 Logger 出口实时落日志），返回结论行应用的日志级别（文案逻辑在 UiTextBuilder）。</summary>
+        private LogLevel AppendVerification(OperationResult result)
+        {
+            if (result.Verification == null)
+            {
+                return result.Success ? LogLevel.Success : LogLevel.Error;
+            }
+
+            LogLevel level;
+            switch (result.Outcome)
+            {
+                case OperationOutcome.Success: level = LogLevel.Success; break;
+                case OperationOutcome.Degraded: level = LogLevel.Warn; break;
+                default: level = LogLevel.Error; break;
+            }
+
+            AppendLog(LogLevel.Info, UiTextBuilder.VerificationSummary(result.Verification));
+            return level;
         }
 
         private bool ConfirmOperation(OperationKind kind)

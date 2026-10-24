@@ -128,20 +128,55 @@ namespace HermesInstaller.Core
         public bool BackupBeforeUpdate { get; set; }
     }
 
+    /// <summary>操作结论三态（DD §2.2 G2）。向后兼容约束：OperationResult.Success 恒等于 (Outcome == Success)。</summary>
+    public enum OperationOutcome
+    {
+        Success,
+        Degraded,
+        Failed
+    }
+
     public sealed class OperationResult
     {
-        public bool Success { get; set; }
+        private OperationOutcome _outcome = OperationOutcome.Failed;
+
+        public OperationOutcome Outcome
+        {
+            get { return _outcome; }
+            set
+            {
+                _outcome = value;
+            }
+        }
+
+        /// <summary>
+        /// 既有判据（MainForm !result.Success 分支）不变：恒等于 (Outcome == Success)，
+        /// 因此 Degraded 也走 !Success 路径（DD §4 期望行为：降级后可能需要网络兜底）。
+        /// </summary>
+        public bool Success
+        {
+            get { return _outcome == OperationOutcome.Success; }
+        }
+
         public string Message { get; set; }
         public string LogPath { get; set; }
 
+        /// <summary>断言明细（三态出结论时填充；null = 旧式即时结论，无可展示断言）。</summary>
+        public VerificationReport Verification { get; set; }
+
         public static OperationResult Ok(string message, string logPath = null)
         {
-            return new OperationResult { Success = true, Message = message, LogPath = logPath };
+            return new OperationResult { Outcome = OperationOutcome.Success, Message = message, LogPath = logPath };
         }
 
         public static OperationResult Error(string message, string logPath = null)
         {
-            return new OperationResult { Success = false, Message = message, LogPath = logPath };
+            return new OperationResult { Outcome = OperationOutcome.Failed, Message = message, LogPath = logPath };
+        }
+
+        public static OperationResult Degrade(string message, string logPath = null)
+        {
+            return new OperationResult { Outcome = OperationOutcome.Degraded, Message = message, LogPath = logPath };
         }
     }
 
