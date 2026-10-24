@@ -176,6 +176,7 @@
 | AC-03 / AC-04 / AC-24 / NFR-01 部分覆盖 | 切级能力、9 类全量注入、真实耗时计时未验 | 分别归 M2（FR-4 分级网络）、M3（状态机/回滚）、M4（版本矩阵） |
 | `EndpointProbe(5s)` 类短超时对 CLI 命令普遍偏紧 | 已在本轮踩到一次（gateway status） | M3 的 `PathResolver` + 统一命令超时策略一并治理 |
 | `InstallLooksPresent` 的缺陷在本轮被顺带修复 | 修复前 `EnvironmentProbe` 的「既有安装」判定恒为「未安装」 | 已在 DEV-4 一并修正，无遗留 |
+| **`EnvironmentProbe.FindHermesProcesses` 存在与 DEV-5 同类的重复缺陷** | UI/自检的「运行中的进程」一栏同一 PID 显示两次（实测 selftest 输出：`Hermes (PID 5384)`、`(PID 10016)`、`(PID 28256)`、`(PID 2268)`、`(PID 9316)` 各出现两遍）。**功能不受影响**——停进程走的是 `StopHermesProcessesAsync` 按根路径匹配的另一条路径，重复 kill 同一 PID 无害 | 该文件在 DD §9 不改清单内（M1 不涉及探针改造）。根因与 DEV-5 完全相同：`:318` 的 `new[] { "Hermes", "hermes", "hermes-gateway" }` 在 Windows 上大小写不敏感，同一批进程被枚举两次。建议随 M3 的 `EnvironmentProbe` 扩展一并按 PID 去重 |
 
 ---
 
@@ -184,6 +185,7 @@
 **⚠️ 部分完成 —— 6 条 FR 全量交付并通过独立验收，FR-1.7 的端到端复原受环境限制未测，标为部分验证。**
 
 - 构建：干净重建 **0 警告 0 错误**，产物 `HermesInstaller.exe` 158.5 KB / zip **76.4 KB**
+- **产物真机冒烟**：`HermesInstaller.exe --selftest` 跑通全链路——环境探针 11 项全过（Win11 build 26200 / AMD64 / PS 5.1 / 磁盘 76.4 GB / 内存 32 GB / 长路径已开 / .NET 4.8）、**CLI 状态正确显示「已安装 0.22.5+456.gc78ca093 @c78ca093」**（`InstallLooksPresent` 修复生效的直接证据）、桌面端 235 MB 已构建、网络探测 11 端点 9 可用、install.ps1 下载成功 86.8 KB、阶段清单 9 个全部解析
 - 探针：5 组、**38 条断言全部 PASSED**（末次整体复跑）
 - 红线：14 条不改清单 **14/14 通过**；语法红线三项全 0
 - 偏差：设计层 6 条（D-1~D-6）+ 实现层 2 条，全部记录在案，无未记录偏差
