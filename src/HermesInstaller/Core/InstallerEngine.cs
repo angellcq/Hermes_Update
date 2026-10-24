@@ -575,7 +575,44 @@ namespace HermesInstaller.Core
             // G8 改造点 9：旧行为等价——以单根构造列表转调新重载。
             var homes = new List<string>();
             homes.Add(HermesPaths.HermesHome);
+
+            // G4（T-HU-DEV-5）E16 证据落地：停杀前把多根画像写进日志（含「选中根之外已保留运行」提示）。
+            try
+            {
+                List<HermesHomeInfo> overview = HomeRegistry.Enumerate();
+                HomeRegistry.MatchProcesses(overview);
+                _logger.Info(HomeRegistry.Describe(overview));
+                LogUnselectedOwnerships(overview);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[G4] 多根概览失败: " + ex.Message);
+            }
+
             await StopHermesProcessesAsync(homes, true, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// G4（T-HU-DEV-5）：把「选中根之外、有运行中进程」的根逐条列出并标注「已保留运行」。
+        /// 只在 selectedOnly=true（默认路径）时有意义：这些根下的进程本轮绝不会被停杀。
+        /// </summary>
+        private void LogUnselectedOwnerships(List<HermesHomeInfo> overview)
+        {
+            foreach (HermesHomeInfo home in overview)
+            {
+                if (home.IsSelected || home.Processes.Count == 0)
+                {
+                    continue;
+                }
+                var pids = new List<string>();
+                foreach (ProcessRef process in home.Processes)
+                {
+                    pids.Add(process.ProcessName + " (PID " + process.Pid + ")");
+                }
+                _logger.Info("[G4] 选中根之外数据根 " + home.Path + " 有 "
+                    + home.Processes.Count + " 个运行中进程（" + string.Join("，", pids.ToArray())
+                    + "），已保留运行。");
+            }
         }
 
         /// <summary>

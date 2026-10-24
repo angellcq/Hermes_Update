@@ -843,6 +843,9 @@ namespace HermesInstaller
             lblProgress.Text = "正在准备…";
             _cts = new CancellationTokenSource();
 
+            var homes = HomeRegistry.Enumerate();
+            HomeRegistry.MatchProcesses(homes);
+            AppendLog(LogLevel.Info, "[G4] " + HomeRegistry.Describe(homes));
             var progress = new Progress<ProgressInfo>(OnProgress);
             var engine = new InstallerEngine(_settings, _logger);
             OperationResult result = null;
