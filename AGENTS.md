@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-10-24 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：14 个 C# 文件 / 473 节点 / 1,165 边 / DB 1.5MB。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-10-24 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**M1 交付后 21 个 C# 文件 / 6,550 行 / 724 节点 / 2,011 边 / DB 2.39MB**（M1 前为 14 / 3,996 / 473 / 1,165 / 1.5MB）。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -25,7 +25,21 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 
 ## 3. 目录结构（括号内为 行数 / 符号数 / 被依赖文件数）
 
-行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；14 个文件合计 **3,997 行 / 473 节点**。扣掉 file/namespace/import 后的真实声明是 **370 个**：method 132、property 98、field 71、class 28、enum_member 19、constant 18、enum 4。
+行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；**M1 交付后 21 个文件合计 6,550 行 / 724 节点**。扣掉 file/namespace/import（共 151 个）后的真实声明是 **573 个**：method 217、property 141、field 107、class 46、enum_member 35、constant 20、enum 7。
+
+**M1（2026-10-24）新增的 7 个 Core 文件（共 2,060 行 / 214 符号）**——下列目录树为 M1 前的结构，新文件已并入 `Core/`：
+
+| 文件 | 行数 | 符号 | 职责 |
+|---|---|---|---|
+| `Core/RetryPolicy.cs` | 169 | 25 | 九类操作超时/重试/退避参数表 + `ProcessRunOptions` |
+| `Core/ResultVerifier.cs` | 524 | 58 | A1–A4 四项断言、`VerificationReport`、三态合成；另含 `ServiceEntry`/`ServiceSnapshot`/`ServiceRestoreResult` |
+| `Core/VersionFingerprint.cs` | 228 | 30 | gitHead + lockSha256 + cliVersion 三元组采集/判等/落盘 |
+| `Core/HomeRegistry.cs` | 272 | 27 | 三个候选数据根枚举 + 去重 + 进程按根归属 |
+| `Core/ServiceStateGuard.cs` | 343 | 21 | 网关状态快照与 `ensure → start → 降级` 复原（含双起防护） |
+| `Core/RunStateStore.cs` | 379 | 40 | `state\run.json` 生命周期，供第二实例读取进度 |
+| `Core/UiTextBuilder.cs` | 145 | 14 | 结论/断言行/多根摘要等文案生成（不引 WinForms） |
+
+**既有文件符号数变化**（M1 后）：`InstallerEngine` 42→52、`ProcessRunner` 25→38、`Models` 89→97、`HermesPaths` 26→30、`MainForm` 102→103。`MainForm.cs` 行数 1,310→**1,345**（NFR-09 预算 ≤1,355）。
 
 ```
 HermesInstaller.sln
@@ -194,7 +208,7 @@ pwsh -File .\build\build.ps1                     # Release 构建 + 打包（35 
 pwsh -File .\build\build.ps1 -Configuration Debug # 换配置
 ```
 
-**实测基线（2026-10-24，SDK 10.0.402 / pwsh 可用）**：`dotnet build` 还原 ~158ms、编译 ~3.8s、**0 警告 0 错误**，产物 `dist/HermesInstaller/HermesInstaller.exe` + `dist/HermesInstaller-win-x64.zip`（57 KB）。这两个数字就是「改完没破坏构建」的对照基线；出现警告先当成新引入的问题查。
+**实测基线（2026-10-24 M1 交付后，SDK 10.0.402 / pwsh 可用）**：`dotnet build` 还原 ~140ms、编译 ~2.4–3.5s、**0 警告 0 错误**，产物 `dist/HermesInstaller/HermesInstaller.exe`（**158.5 KB**）+ `dist/HermesInstaller-win-x64.zip`（**76.4 KB**）。M1 前基线为 57 KB。这两个数字就是「改完没破坏构建」的对照基线；出现警告先当成新引入的问题查。
 
 产物验证：exe 能启动、环境探针跑完不崩。
 
