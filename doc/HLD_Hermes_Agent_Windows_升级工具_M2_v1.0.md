@@ -434,7 +434,7 @@ RunWithFailoverAsync(Func<Dictionary<string,string>, Task<ProcessResult>> action
 | **R-M2-04** | **冷却状态落盘的并发** | 两个实例同时写 → 后写覆盖 | 读失败即视为无记录；写入走 `.tmp` 替换 | 接受"最后写入者胜"（冷却信息非关键）；文件带 `schemaVersion` |
 | **R-M2-05** | **per-group 状态机可能过度设计** | 8 组 × 3 级 = 24 个状态，代码复杂度上升 | 先实现，若实测发现多数组从不降级（如 `Installer` 组只有 L0），可后续收敛 | 初版即把「只有 1 个候选的组」短路掉（`CandidatesFor` 返回单元素时 `ShouldDowngrade` 恒 false） |
 | **R-M2-06** | **速率阈值 100 KB/s 在慢速镜像下会误判** | 正常但慢的源被降级 | 用真实镜像测（npmmirror 实测 1.8 MB/s，tuna 207ms） | 阈值只在「本次传输量预计 > 5 MB」时才生效（PRD 原文），小文件不测速率 |
-| **R-M2-07** | **`UV_INDEX_URL` 对 uv.lock 的 hash 固定无效**（PRD FR-1.4 提到的现象） | 镜像索引可能不生效，仍走官方 | 实测：`UV_INDEX_URL` 指向 tuna 时 `uv sync` 是否真的走镜像 | 若确认无效，改为 `UV_DEFAULT_INDEX` + `--index-strategy unsafe-best-match`（需实测确认参数名） |
+| **R-M2-07** | **`UV_INDEX_URL` 已被 uv 弃用**（实测 uv 0.12.19：`--index-url` 标注 `Deprecated: use --default-index instead`） | 若只注入 `UV_INDEX_URL`，新版本 uv 可能不生效 | 已实测确认参数名：`--index-strategy` 可选值仅 `first-index` / `unsafe-first-match` / `unsafe-best-match` | **现有 `NetworkPreparer.cs:41-42` 已同时注入 `UV_DEFAULT_INDEX` 与 `UV_INDEX_URL`，做法正确**——M2 保持两者并存即可，`UV_DEFAULT_INDEX` 为准；可选追加 `UV_INDEX_STRATEGY=unsafe-best-match`（多镜像时才需要） |
 
 ---
 

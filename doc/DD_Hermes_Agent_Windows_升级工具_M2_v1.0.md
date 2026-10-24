@@ -186,7 +186,8 @@ ShouldDowngrade(g):
 ```
 Downgrade(g, reason):
     st = _states[g]
-    next = Mirrors.GroupsFor(g).Where(e => e.Level > st.Level).Min(e => e.Level)
+    next = NextLevelOf(g, st.Level)          // 实际存在的下一级最小值；不存在时返回 int.MaxValue
+    if next == int.MaxValue || next <= st.Level: return    // ← 哨兵判断必须显式排除（D-M2-1）
     st.Level = next
     st.CooldownUntilUtc = DateTime.UtcNow.AddSeconds(300)     // PRD: 降级后 300s 内不回试
     st.ConsecutiveFailures = 0
@@ -195,9 +196,11 @@ Downgrade(g, reason):
 
 Recover(g):
     st = _states[g]
-    if st.Level == 0: return
+    if st.Level <= 0: return
     if DateTime.UtcNow < st.CooldownUntilUtc: return           // 冷却中
-    st.Level = st.Level - 1                                   // 只回一级，本次操作内最多调用 1 次
+    prev = PrevLevelOf(g, st.Level)                           // 实际存在的上一级最大值；不存在返回 -1
+    if prev < 0: return
+    st.Level = prev                                           // 只回一级（**不是** Level-1：Npm 只有 0/2，减 1 会落到不存在的 L1）
     st.ConsecutiveFailures = 0
     SaveCooldowns()
 ```
@@ -529,3 +532,25 @@ EnableL1 = true;          // D-12：L1 参与调度
 12. **不写用户全局配置**：不得生成/修改 `.gitconfig`、`.npmrc`、`pip.ini`、`uv.toml`。
 13. 不 `git commit` / `git push`（由 Hermes 验收后统一处理）。
 14. `MainForm.cs` 净增 ≤ 30 行（1,345 → ≤1,375）。
+
+---
+
+## 10. 实现偏差与实测修正（首轮验收后回填，2026-10-24）
+
+> 原则（技能教训）：执行方照抄 DD 出错时，先判是「实现错」还是「DD 错」。DD 本身错的场合，必须**同轮**做三件事：改 DD、加偏差记录、重派同一张卡。只改代码不改 DD，下一个接手人会把同个坑再踩一遍。
+
+| 编号 | 类型 | 位置 | 现象（实测证据） | 处置 |
+|---|---|---|---|---|
+| **D-M2-1** | **实现错（P0）** | `NetworkPlanner.cs` 的 `Downgrade` | `NextLevelOf` 用 `int.MaxValue` 表示「无下一级」，但 `Downgrade` 只判断 `if (next <= state.Level) return;`——`int.MaxValue <= 0` 为 **false**，不 return，直接把 `Level` 写成 `2147483647`。实测：对只有 L0 的 `Installer` 组调 `Downgrade` 后 `CurrentLevel` 返回 `2147483647`，与该方法注释「已在最低级时不做任何事」矛盾。后果：该组 `CandidatesFor` 返回空，`NetworkPreparer` 取不到 URL | 改为 `if (next == int.MaxValue \|\| next <= state.Level) return;`；DD 伪代码已同步（见 §2.2 G1）。**由「应失败支」探针抓到**，happy-path 断言发现不了 |
+| **D-M2-2** | **DD 错（我写错）** | `Mirrors.cs` 的 `Pick*` 系列 | DD §2.2 G3 的端点表把 Id 改成新命名（`electron-0/1`、`builder-0/1`、`npm-0/1`、`pip-0/1`），但同一节的改造点又写「`Pick*` 保留不动」——两处口径冲突。实测后果：`PickElectronMirror`/`PickBuilderMirror`/`PickNpmRegistry`/`PickPipIndex` 用旧前缀 `electron-mirror`/`builder-mirror`/`npm-registry`/`pip-index`，`StartsWith` 全部匹配不到，**4 个方法退化为永远返回兜底默认值**（只有 `PickRepoMirror` 的 `repo-` 前缀幸存） | 把四个方法的前缀改为 `electron-`/`builder-`/`npm-`/`pip-`。`Pick*` 仅用于 UI 展示，不参与实际选源，故不需要在内部实现分级优先级 |
+| **D-M2-3** | **执行方修对了 DD（接受）** | `NetworkPlanner.Recover` | DD 伪代码原写 `st.Level = st.Level - 1`，但 Npm/Pip/Chromium 只有 L0 与 L2，从 2 减 1 会落到**不存在的 L1**。执行方改用 `PrevLevelOf` 取「实际存在的上一级最大值」，并对 `PrevLevelOf` 的 `-1` 哨兵做了 `if (prev < 0) return;` 判断 | **采纳执行方实现**，DD 伪代码已按此改写（§2.2 G1）。这是「DD 错、实现对」的正面案例 |
+| **D-M2-4** | **实现方式差异（接受，但验收口径需调整）** | `Models.cs:89` | `NetworkEndpoint` 的 6 参构造改为 `(..., bool critical, int level = 0)` 的 **7 参带默认值**形式。C# 源码级 `new NetworkEndpoint(6 个参数)` 照常编译，但**反射 `GetConstructor(6 个类型)` 找不到** | 接受（C# 可选参数是标准做法，项目内无反射构造该类型的代码）。验收探针的构造断言改为「存在一个 7 参构造且末参有默认值」 |
+| **D-M2-5** | **代码规模偏差（需说明）** | `Core/NetworkPlanner.cs` | DD 预估约 320 行，实际 **598 行**（+87%）。主要原因是 XML 文档注释密集 + `LoadCooldowns`/`SaveCooldownsCore`/`PrevLevelOf`/`MaxLevelOf`/`NextLevelOf` 等辅助方法拆得较细 | 接受（Core 层不与 `MainForm` 争行数预算；NFR-09 只约束 `MainForm`）。CLS 卡回填 AGENTS.md 时按实际数字记 |
+
+### 验收口径调整
+
+| 原断言 | 调整后 |
+|---|---|
+| 「既有 6 参构造保留」（反射 `GetConstructor(6 类型)`） | 「存在 7 参构造且第 7 参 `level` 有默认值 0」（D-M2-4） |
+| 未覆盖 | 新增「对只有 L0 的组调 `Downgrade`，级必须不变」（D-M2-1 的应失败支，首轮就是它抓到的） |
+| 未覆盖 | 新增「`Pick*` 四个方法在给定探测结果时能返回非默认值」（D-M2-2） |

@@ -80,9 +80,13 @@ namespace HermesInstaller.Core
         public NetworkKind Kind { get; set; }
         public bool Critical { get; set; }
 
+        /// <summary>分级（FR-4.1）：0=官方直连，1=加速代理，2=国内镜像；Npm/Pip/Chromium 无 L1。</summary>
+        [DataMember(Name = "level")]
+        public int Level { get; set; }
+
         public NetworkEndpoint() { }
 
-        public NetworkEndpoint(string id, string name, string category, string url, NetworkKind kind, bool critical)
+        public NetworkEndpoint(string id, string name, string category, string url, NetworkKind kind, bool critical, int level = 0)
         {
             Id = id;
             Name = name;
@@ -90,6 +94,7 @@ namespace HermesInstaller.Core
             Url = url;
             Kind = kind;
             Critical = critical;
+            Level = level;
         }
     }
 
