@@ -431,3 +431,4 @@ FodyWeavers.xsd
 dist/
 payload/
 /.hermes/
+/.codegraph/
