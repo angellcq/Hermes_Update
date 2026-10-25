@@ -32,6 +32,11 @@ namespace HermesInstaller
                 RunSelfTest();
                 return;
             }
+            if (HasArg(args, "--ssh-proxy-test"))
+            {
+                RunSshProxyTest();
+                return;
+            }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -164,9 +169,112 @@ namespace HermesInstaller
             try { Console.WriteLine(report.ToString()); } catch { }
         }
 
+        /// <summary>
+        /// E14：免 GUI 验证 SSH 代理链路（起隧道 → 起本地 HTTP 桥 → 经桥取出口 IP）。
+        /// 配置读 settings.json；密码可用环境变量 HERMES_SSH_PASSWORD 临时注入，
+        /// 避免为了冒烟把密码写进磁盘。结果同时写 %TEMP%\hermes-ssh-proxy-test.txt。
+        /// </summary>
+        private static void RunSshProxyTest()
+        {
+            var report = new System.Text.StringBuilder();
+            Action<string> line = text => { report.AppendLine(text); };
+            try { AttachConsole(-1); } catch { }
+
+            Core.Logger logger = null;
+            try
+            {
+                logger = new Core.Logger();
+                logger.Start("ssh-proxy-test");
+                logger.Logged += entry => line(string.Format("[{0}] {1}", entry.Level, entry.Message));
+
+                Core.Settings settings = Core.Settings.Load();
+                line("=== Hermes 安装助手 / SSH 代理自检 ===");
+                line("时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                line(string.Format("配置: enabled={0} host={1} port={2} user={3} socks={4} http={5}",
+                    settings.SshProxyEnabled, settings.SshHost, settings.SshPort,
+                    settings.SshUser, settings.SshSocksPort, settings.SshHttpPort));
+                line("密码来源: " + (string.IsNullOrEmpty(settings.GetSshPassword())
+                    ? (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("HERMES_SSH_PASSWORD"))
+                        ? "(未配置)" : "环境变量 HERMES_SSH_PASSWORD")
+                    : "settings.json（DPAPI）"));
+                line("ssh.exe: " + (Core.SshProxyTunnel.FindSshExe() ?? "(未找到)"));
+
+                if (!settings.SshProxyEnabled)
+                {
+                    line("提示: settings.json 里 sshProxyEnabled=false，本轮强制按启用处理。");
+                    settings.SshProxyEnabled = true;
+                }
+
+                bool started = Core.ProxyRuntime
+                    .EnsureStartedAsync(settings, logger, CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                line("");
+                line("隧道启动: " + (started ? "成功" : "失败 — " + Core.ProxyRuntime.LastError));
+                if (started)
+                {
+                    line("SOCKS5 : 127.0.0.1:" + Core.ProxyRuntime.SocksPort);
+                    line("HTTP   : " + Core.ProxyRuntime.HttpProxyUrl);
+                    try
+                    {
+                        line(Core.ProxyRuntime.TestExitIp());
+                        line("经代理访问 google/generate_204: " + GetStatusThroughProxy("https://www.google.com/generate_204"));
+                    }
+                    catch (Exception ex)
+                    {
+                        line("经代理请求失败: " + ex.Message);
+                    }
+
+                    // 支持用 HERMES_SSH_PROXY_HOLD_SECONDS 保持隧道存活，便于并行验证
+                    // curl -x / git ls-remote / npm 等子进程是否真的走了代理。
+                    int hold;
+                    if (int.TryParse(Environment.GetEnvironmentVariable("HERMES_SSH_PROXY_HOLD_SECONDS"), out hold)
+                        && hold > 0)
+                    {
+                        line("");
+                        line("保持隧道 " + hold + " 秒（供并行验证 curl/git/npm）…");
+                        Thread.Sleep(TimeSpan.FromSeconds(hold));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                line("自检异常: " + ex);
+            }
+            finally
+            {
+                Core.ProxyRuntime.Stop();
+                if (logger != null)
+                {
+                    line("");
+                    line("日志: " + logger.LogPath);
+                    logger.Dispose();
+                }
+                line("=== 自检结束 ===");
+            }
+
+            string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hermes-ssh-proxy-test.txt");
+            try { System.IO.File.WriteAllText(path, report.ToString(), new System.Text.UTF8Encoding(false)); } catch { }
+            try { Console.WriteLine(report.ToString()); } catch { }
+        }
+
+        private static string GetStatusThroughProxy(string url)
+        {
+            using (var handler = new System.Net.Http.HttpClientHandler { UseProxy = true })
+            using (var client = new System.Net.Http.HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(30)
+            })
+            {
+                using (var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, url))
+                using (var response = client.SendAsync(request).GetAwaiter().GetResult())
+                {
+                    return ((int)response.StatusCode).ToString();
+                }
+            }
+        }
+
         [System.Runtime.InteropServices.DllImport("kernel32.dll")]
         private static extern bool AttachConsole(int processId);
-
         private static void RunHostsAction(bool apply)
         {
             try

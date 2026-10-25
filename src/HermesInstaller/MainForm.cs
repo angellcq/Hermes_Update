@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
@@ -11,55 +11,11 @@ using HermesInstaller.Core;
 
 namespace HermesInstaller
 {
-    public sealed class MainForm : Form
+    public partial class MainForm : Form
     {
         private readonly Settings _settings;
         private readonly Logger _logger = new Logger();
 
-        private Label lblTitle;
-        private Label lblSubtitle;
-        private Label lblStatus;
-        private Label lblLatest;
-        private Label lblCliState;
-        private Label lblDesktopState;
-        private DataGridView dgvProbe;
-        private DataGridView dgvNetwork;
-        private Button btnRefresh;
-        private Button btnNetwork;
-        private ProgressBar pb;
-        private Label lblProgress;
-        private RichTextBox rtbLog;
-        private Button btnCancel;
-        private Button btnOpenLogs;
-        private Button btnSaveLog;
-        private Button btnOpenData;
-        private Button btnAbout;
-        private Button btnApplyMirrors;
-        private Button btnFixHosts;
-        private Button btnRestoreHosts;
-
-        private ComboBox cmbChannel;
-        private ComboBox cmbRepoMirror;
-        private ComboBox cmbElectronMirror;
-        private ComboBox cmbBuilderMirror;
-        private ComboBox cmbNpmRegistry;
-        private ComboBox cmbPipIndex;
-        private CheckBox chkSkipBrowser;
-        private CheckBox chkSkipComputerUse;
-        private CheckBox chkBackup;
-        private CheckBox chkHostsFallback;
-
-        private Button btnCliInstall;
-        private Button btnCliRepair;
-        private Button btnCliUpgrade;
-        private Button btnCliUninstall;
-        private Button btnCliLaunch;
-        private Button btnDesktopInstall;
-        private Button btnDesktopRepair;
-        private Button btnDesktopUpgrade;
-        private Button btnDesktopLaunch;
-
-        private SplitContainer _split;
         private ProbeReport _lastReport;
         private System.Collections.Generic.List<NetworkResult> _networkResults;
         private CancellationTokenSource _cts;
@@ -70,12 +26,15 @@ namespace HermesInstaller
 
         public MainForm()
         {
+            InitializeComponent();
+
+            // 设计器会实例化本窗体：此时不要读配置、不要起后台探测。
+            if (LicenseManager.UsageMode == LicenseUsageMode.Designtime)
+            {
+                return;
+            }
+
             _settings = Settings.Load();
-            Text = "Hermes 安装助手";
-            StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(1000, 700);
-            Size = new Size(1200, 860);
-            Font = new Font("Microsoft YaHei UI", 9F);
             try
             {
                 Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
@@ -85,9 +44,41 @@ namespace HermesInstaller
                 Icon = SystemIcons.Application;
             }
 
-            BuildUi();
             LoadSettingsToUi();
             UpdateButtons();
+            WireEvents();
+        }
+
+        private void WireEvents()
+        {
+            btnAbout.Click += (s, e) => ShowAbout();
+            btnOpenData.Click += (s, e) => OpenFolder(Directory.Exists(HermesPaths.HermesHome) ? HermesPaths.HermesHome : HermesPaths.AppDataDir);
+            btnSaveLog.Click += (s, e) => SaveLog();
+            btnOpenLogs.Click += (s, e) => OpenFolder(HermesPaths.LogDirectory);
+            btnCancel.Click += (s, e) => CancelOperation();
+            btnRefresh.Click += async (s, e) => await RefreshEnvironmentAsync();
+            btnNetwork.Click += async (s, e) => await RefreshNetworkAsync();
+            btnApplyMirrors.Click += (s, e) => { ApplySettingsFromUi(); _settings.Save(); AppendLog(LogLevel.Success, "已应用镜像设置。"); };
+            btnFixHosts.Click += async (s, e) => await FixHostsAsync();
+            btnRestoreHosts.Click += (s, e) => RestoreHosts();
+            btnProxy.Click += (s, e) => EditProxySettings();
+            chkHostsFallback.CheckedChanged += OnHostsFallbackChanged;
+
+            btnCliInstall.Click += async (s, e) => await RunOperationAsync(OperationKind.CliInstall);
+            btnCliRepair.Click += async (s, e) => await RunOperationAsync(OperationKind.CliRepair);
+            btnCliUpgrade.Click += async (s, e) => await RunOperationAsync(OperationKind.CliUpgrade);
+            btnCliUninstall.Click += async (s, e) => await RunOperationAsync(OperationKind.CliUninstall);
+            btnCliLaunch.Click += (s, e) => LaunchCli();
+
+            btnDesktopInstall.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopInstall);
+            btnDesktopRepair.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopRepair);
+            btnDesktopUpgrade.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopUpgrade);
+            btnDesktopLaunch.Click += (s, e) => LaunchDesktop();
+
+            rightScroll.Resize += (sender, args) =>
+            {
+                try { rightLayout.Width = Math.Max(340, rightScroll.ClientSize.Width - 16); } catch { }
+            };
 
             _logger.Logged += entry => AppendLog(entry.Level, entry.Message);
             Shown += async (sender, args) =>
@@ -102,480 +93,20 @@ namespace HermesInstaller
         {
             try
             {
-                if (_split == null || _split.Width < 400)
+                if (splitMain == null || splitMain.Width < 400)
                 {
                     return;
                 }
-                int width = _split.Width;
+                int width = splitMain.Width;
                 int desired = (int)(width * 0.58);
                 int lower = 200;
-                int upper = width - 200 - _split.SplitterWidth;
+                int upper = width - 200 - splitMain.SplitterWidth;
                 if (upper > lower)
                 {
-                    _split.SplitterDistance = Math.Max(lower, Math.Min(desired, upper));
+                    splitMain.SplitterDistance = Math.Max(lower, Math.Min(desired, upper));
                 }
             }
             catch { }
-        }
-
-        // ------------------------------------------------------------------- UI
-
-        private void BuildUi()
-        {
-            var root = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                RowCount = 3,
-                Padding = new Padding(0)
-            };
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 56));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 44));
-            Controls.Add(root);
-
-            // Header
-            var header = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 2,
-                RowCount = 2,
-                Padding = new Padding(14, 6, 14, 4)
-            };
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-            lblTitle = new Label
-            {
-                Text = "Hermes 安装助手",
-                AutoSize = true,
-                Font = new Font("Microsoft YaHei UI", 17F, FontStyle.Bold),
-                ForeColor = Color.FromArgb(38, 38, 38)
-            };
-            lblSubtitle = new Label
-            {
-                Text = "Hermes CLI + 桌面端 · 新装 / 重装 / 升级 · 环境与镜像检测",
-                AutoSize = true,
-                ForeColor = Color.DimGray,
-                Margin = new Padding(2, 2, 0, 0)
-            };
-            lblStatus = new Label
-            {
-                Text = "检测中…",
-                AutoSize = true,
-                Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
-                ForeColor = Color.DimGray,
-                TextAlign = ContentAlignment.MiddleRight,
-                Anchor = AnchorStyles.Right,
-                Margin = new Padding(12, 6, 0, 0)
-            };
-
-            header.Controls.Add(lblTitle, 0, 0);
-            header.Controls.Add(lblSubtitle, 0, 1);
-            header.Controls.Add(lblStatus, 1, 0);
-            header.SetRowSpan(lblStatus, 2);
-            root.Controls.Add(header, 0, 0);
-
-            // Middle
-            var split = new SplitContainer
-            {
-                Dock = DockStyle.Fill,
-                Orientation = Orientation.Vertical
-            };
-            _split = split;
-            root.Controls.Add(split, 0, 1);
-
-            BuildLeftPanel(split.Panel1);
-            BuildRightPanel(split.Panel2);
-
-            // Bottom
-            var bottom = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                RowCount = 3,
-                Padding = new Padding(10, 4, 10, 8)
-            };
-            bottom.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-            bottom.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            bottom.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-            root.Controls.Add(bottom, 0, 2);
-
-            var progressPanel = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 2,
-                RowCount = 1
-            };
-            progressPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
-            progressPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            progressPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-            pb = new ProgressBar
-            {
-                Dock = DockStyle.Fill,
-                Minimum = 0,
-                Maximum = 100,
-                Style = ProgressBarStyle.Continuous,
-                Margin = new Padding(0, 8, 10, 8)
-            };
-            lblProgress = new Label
-            {
-                Text = "就绪",
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-                ForeColor = Color.DimGray
-            };
-            progressPanel.Controls.Add(pb, 0, 0);
-            progressPanel.Controls.Add(lblProgress, 1, 0);
-            bottom.Controls.Add(progressPanel, 0, 0);
-
-            rtbLog = new RichTextBox
-            {
-                Dock = DockStyle.Fill,
-                ReadOnly = true,
-                BackColor = Color.FromArgb(250, 250, 250),
-                ForeColor = Color.FromArgb(40, 40, 40),
-                BorderStyle = BorderStyle.FixedSingle,
-                Font = new Font("Consolas", 9F),
-                WordWrap = false,
-                HideSelection = false,
-                ScrollBars = RichTextBoxScrollBars.Both,
-                DetectUrls = false
-            };
-            bottom.Controls.Add(rtbLog, 0, 1);
-
-            var buttons = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.RightToLeft,
-                WrapContents = false,
-                Padding = new Padding(0, 4, 0, 0)
-            };
-            btnAbout = MakeButton("关于", 72);
-            btnOpenData = MakeButton("打开数据目录", 108);
-            btnSaveLog = MakeButton("保存日志", 88);
-            btnOpenLogs = MakeButton("打开日志目录", 108);
-            btnCancel = MakeButton("取消", 72);
-            btnCancel.Enabled = false;
-
-            btnAbout.Click += (s, e) => ShowAbout();
-            btnOpenData.Click += (s, e) => OpenFolder(Directory.Exists(HermesPaths.HermesHome) ? HermesPaths.HermesHome : HermesPaths.AppDataDir);
-            btnSaveLog.Click += (s, e) => SaveLog();
-            btnOpenLogs.Click += (s, e) => OpenFolder(HermesPaths.LogDirectory);
-            btnCancel.Click += (s, e) => CancelOperation();
-
-            buttons.Controls.Add(btnAbout);
-            buttons.Controls.Add(btnOpenData);
-            buttons.Controls.Add(btnSaveLog);
-            buttons.Controls.Add(btnOpenLogs);
-            buttons.Controls.Add(btnCancel);
-            bottom.Controls.Add(buttons, 0, 2);
-        }
-
-        private void BuildLeftPanel(Control parent)
-        {
-            var layout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                RowCount = 2,
-                Padding = new Padding(10, 4, 6, 8)
-            };
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            parent.Controls.Add(layout);
-
-            var toolbar = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
-                Padding = new Padding(0)
-            };
-            btnRefresh = MakeButton("重新检测", 96);
-            btnNetwork = MakeButton("检测镜像", 96);
-            btnRefresh.Click += async (s, e) => await RefreshEnvironmentAsync();
-            btnNetwork.Click += async (s, e) => await RefreshNetworkAsync();
-            lblLatest = new Label
-            {
-                Text = "官方最新: -",
-                AutoSize = true,
-                ForeColor = Color.DimGray,
-                Margin = new Padding(10, 8, 0, 0)
-            };
-            toolbar.Controls.Add(btnRefresh);
-            toolbar.Controls.Add(btnNetwork);
-            toolbar.Controls.Add(lblLatest);
-            layout.Controls.Add(toolbar, 0, 0);
-
-            var tabs = new TabControl { Dock = DockStyle.Fill };
-            var envTab = new TabPage("环境检测") { BackColor = Color.White };
-            var netTab = new TabPage("镜像检测") { BackColor = Color.White };
-
-            dgvProbe = CreateGrid();
-            AddColumn(dgvProbe, "类别", 8);
-            AddColumn(dgvProbe, "检查项", 16);
-            AddColumn(dgvProbe, "期望", 20);
-            AddColumn(dgvProbe, "实际", 24);
-            AddColumn(dgvProbe, "状态", 8);
-            AddColumn(dgvProbe, "建议", 30);
-            envTab.Controls.Add(dgvProbe);
-
-            dgvNetwork = CreateGrid();
-            AddColumn(dgvNetwork, "类别", 8);
-            AddColumn(dgvNetwork, "用途", 18);
-            AddColumn(dgvNetwork, "端点", 38);
-            AddColumn(dgvNetwork, "状态", 8);
-            AddColumn(dgvNetwork, "延迟", 8);
-            AddColumn(dgvNetwork, "说明", 26);
-            netTab.Controls.Add(dgvNetwork);
-
-            tabs.TabPages.Add(envTab);
-            tabs.TabPages.Add(netTab);
-            layout.Controls.Add(tabs, 0, 1);
-        }
-
-        private void BuildRightPanel(Control parent)
-        {
-            var scroll = new Panel
-            {
-                Dock = DockStyle.Fill,
-                AutoScroll = true,
-                Padding = new Padding(0, 4, 8, 8)
-            };
-            parent.Controls.Add(scroll);
-
-            var layout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Top,
-                ColumnCount = 1,
-                RowCount = 4,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Width = 460
-            };
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            scroll.Controls.Add(layout);
-            scroll.Resize += (sender, args) =>
-            {
-                try { layout.Width = Math.Max(340, scroll.ClientSize.Width - 16); } catch { }
-            };
-
-            // Options
-            var options = new GroupBox
-            {
-                Text = "安装选项",
-                Dock = DockStyle.Fill,
-                Padding = new Padding(8),
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink
-            };
-            var opt = new TableLayoutPanel
-            {
-                Dock = DockStyle.Top,
-                ColumnCount = 2,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink
-            };
-            opt.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
-            opt.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-
-            cmbChannel = MakeCombo(new[] { "stable", "main" });
-            cmbRepoMirror = MakeCombo(Mirrors.RepoCandidates);
-            cmbElectronMirror = MakeCombo(new[] { Mirrors.ElectronMirror });
-            cmbBuilderMirror = MakeCombo(new[] { Mirrors.BuilderMirror });
-            cmbNpmRegistry = MakeCombo(new[] { Mirrors.NpmRegistry, "https://registry.npmjs.org" });
-            cmbPipIndex = MakeCombo(new[] { Mirrors.PipIndex, "https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/simple" });
-
-            AddOptionRow(opt, "发布通道", cmbChannel);
-            AddOptionRow(opt, "源码镜像", cmbRepoMirror);
-            AddOptionRow(opt, "Electron", cmbElectronMirror);
-            AddOptionRow(opt, "构建工具", cmbBuilderMirror);
-            AddOptionRow(opt, "npm 镜像", cmbNpmRegistry);
-            AddOptionRow(opt, "PyPI 镜像", cmbPipIndex);
-
-            chkSkipBrowser = new CheckBox { Text = "跳过浏览器工具（省 ~500MB）", AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
-            chkSkipComputerUse = new CheckBox { Text = "跳过电脑操作驱动", AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
-            chkBackup = new CheckBox { Text = "升级前完整备份", AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
-            chkHostsFallback = new CheckBox { Text = "镜像失败时允许尝试修复 hosts（需管理员）", AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
-            chkHostsFallback.CheckedChanged += OnHostsFallbackChanged;
-
-            AddWideRow(opt, chkSkipBrowser);
-            AddWideRow(opt, chkSkipComputerUse);
-            AddWideRow(opt, chkBackup);
-            AddWideRow(opt, chkHostsFallback);
-
-            var optButtons = new FlowLayoutPanel
-            {
-                AutoSize = true,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = true,
-                Margin = new Padding(0, 8, 0, 0)
-            };
-            btnApplyMirrors = MakeButton("应用镜像", 88);
-            btnFixHosts = MakeButton("修复 hosts", 96);
-            btnRestoreHosts = MakeButton("还原 hosts", 96);
-            btnApplyMirrors.Click += (s, e) => { ApplySettingsFromUi(); _settings.Save(); AppendLog(LogLevel.Success, "已应用镜像设置。"); };
-            btnFixHosts.Click += async (s, e) => await FixHostsAsync();
-            btnRestoreHosts.Click += (s, e) => RestoreHosts();
-            optButtons.Controls.Add(btnApplyMirrors);
-            optButtons.Controls.Add(btnFixHosts);
-            optButtons.Controls.Add(btnRestoreHosts);
-            AddWideRow(opt, optButtons);
-
-            options.Controls.Add(opt);
-            layout.Controls.Add(options, 0, 2);
-
-            // CLI
-            var cliGroup = new GroupBox
-            {
-                Text = "Hermes CLI",
-                Dock = DockStyle.Fill,
-                Padding = new Padding(8),
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink
-            };
-            var cli = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 1, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
-            lblCliState = new Label { Text = "状态: -", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(0, 0, 0, 4) };
-            var cliButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = true };
-            btnCliInstall = MakeButton("新装", 92);
-            btnCliRepair = MakeButton("修复重装", 96);
-            btnCliUpgrade = MakeButton("升级", 92);
-            btnCliUninstall = MakeButton("卸载", 92);
-            btnCliLaunch = MakeButton("启动", 92);
-            btnCliInstall.Click += async (s, e) => await RunOperationAsync(OperationKind.CliInstall);
-            btnCliRepair.Click += async (s, e) => await RunOperationAsync(OperationKind.CliRepair);
-            btnCliUpgrade.Click += async (s, e) => await RunOperationAsync(OperationKind.CliUpgrade);
-            btnCliUninstall.Click += async (s, e) => await RunOperationAsync(OperationKind.CliUninstall);
-            btnCliLaunch.Click += (s, e) => LaunchCli();
-            cliButtons.Controls.Add(btnCliInstall);
-            cliButtons.Controls.Add(btnCliRepair);
-            cliButtons.Controls.Add(btnCliUpgrade);
-            cliButtons.Controls.Add(btnCliUninstall);
-            cliButtons.Controls.Add(btnCliLaunch);
-            cli.Controls.Add(lblCliState);
-            cli.Controls.Add(cliButtons);
-            cliGroup.Controls.Add(cli);
-            layout.Controls.Add(cliGroup, 0, 0);
-
-            // Desktop
-            var desktopGroup = new GroupBox
-            {
-                Text = "Hermes 桌面端",
-                Dock = DockStyle.Fill,
-                Padding = new Padding(8),
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink
-            };
-            var desktop = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 1, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
-            lblDesktopState = new Label { Text = "状态: -", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(0, 0, 0, 4) };
-            var desktopButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = true };
-            btnDesktopInstall = MakeButton("新装", 92);
-            btnDesktopRepair = MakeButton("修复重装", 96);
-            btnDesktopUpgrade = MakeButton("升级", 92);
-            btnDesktopLaunch = MakeButton("启动", 92);
-            btnDesktopInstall.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopInstall);
-            btnDesktopRepair.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopRepair);
-            btnDesktopUpgrade.Click += async (s, e) => await RunOperationAsync(OperationKind.DesktopUpgrade);
-            btnDesktopLaunch.Click += (s, e) => LaunchDesktop();
-            desktopButtons.Controls.Add(btnDesktopInstall);
-            desktopButtons.Controls.Add(btnDesktopRepair);
-            desktopButtons.Controls.Add(btnDesktopUpgrade);
-            desktopButtons.Controls.Add(btnDesktopLaunch);
-            desktop.Controls.Add(lblDesktopState);
-            desktop.Controls.Add(desktopButtons);
-            desktopGroup.Controls.Add(desktop);
-            layout.Controls.Add(desktopGroup, 0, 1);
-
-            var hint = new Label
-            {
-                Text = "提示：默认使用镜像，无需管理员权限。只有镜像全部失败时才会提示修复 hosts。",
-                Dock = DockStyle.Top,
-                AutoSize = true,
-                ForeColor = Color.Gray,
-                Padding = new Padding(2, 8, 0, 0)
-            };
-            layout.Controls.Add(hint, 0, 3);
-        }
-
-        private static Button MakeButton(string text, int width)
-        {
-            return new Button
-            {
-                Text = text,
-                Width = width,
-                Height = 30,
-                Margin = new Padding(0, 0, 8, 8),
-                UseVisualStyleBackColor = true
-            };
-        }
-
-        private static ComboBox MakeCombo(string[] items)
-        {
-            var combo = new ComboBox
-            {
-                Dock = DockStyle.Fill,
-                DropDownStyle = ComboBoxStyle.DropDown,
-                Margin = new Padding(0, 3, 0, 3)
-            };
-            combo.Items.AddRange(items);
-            return combo;
-        }
-
-        private static void AddOptionRow(TableLayoutPanel table, string label, Control control)
-        {
-            int row = table.RowCount;
-            table.RowCount = row + 1;
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(new Label { Text = label, AutoSize = true, TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(0, 6, 6, 3) }, 0, row);
-            table.Controls.Add(control, 1, row);
-        }
-
-        private static void AddWideRow(TableLayoutPanel table, Control control)
-        {
-            int row = table.RowCount;
-            table.RowCount = row + 1;
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(control, 0, row);
-            table.SetColumnSpan(control, 2);
-        }
-
-        private static DataGridView CreateGrid()
-        {
-            var grid = new DataGridView
-            {
-                Dock = DockStyle.Fill,
-                ReadOnly = true,
-                AllowUserToAddRows = false,
-                AllowUserToDeleteRows = false,
-                AllowUserToResizeRows = false,
-                RowHeadersVisible = false,
-                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
-                BackgroundColor = Color.White,
-                BorderStyle = BorderStyle.None,
-                MultiSelect = false,
-                AllowUserToOrderColumns = false
-            };
-            grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
-            grid.DefaultCellStyle.WrapMode = DataGridViewTriState.False;
-            return grid;
-        }
-
-        private static void AddColumn(DataGridView grid, string header, int weight)
-        {
-            grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                HeaderText = header,
-                FillWeight = weight,
-                SortMode = DataGridViewColumnSortMode.NotSortable
-            });
         }
 
         // -------------------------------------------------------------- settings
@@ -601,8 +132,7 @@ namespace HermesInstaller
         }
 
         private void ApplySettingsFromUi()
-        {
-            _settings.Channel = cmbChannel.SelectedItem as string;
+        {            _settings.Channel = cmbChannel.SelectedItem as string;
             if (string.IsNullOrWhiteSpace(_settings.Channel))
             {
                 _settings.Channel = cmbChannel.Text.Trim();
@@ -620,6 +150,23 @@ namespace HermesInstaller
             _settings.BuilderMirror = cmbBuilderMirror.Text.Trim();
             _settings.NpmRegistry = cmbNpmRegistry.Text.Trim();
             _settings.PipIndex = cmbPipIndex.Text.Trim();
+        }
+
+        /// <summary>
+        /// E14：SSH 代理配置入口。先把界面上现有选项收进 settings（避免保存代理时
+        /// 把镜像等未提交的旧值写回去），再弹独立对话框。
+        /// </summary>
+        private void EditProxySettings()
+        {
+            ApplySettingsFromUi();
+            if (Ui.ProxyForm.Edit(this, _settings, _logger))
+            {
+                _settings.Save();
+                AppendLog(LogLevel.Success, _settings.SshProxyEnabled
+                    ? "SSH 代理已启用: " + _settings.SshUser + "@" + _settings.SshHost
+                        + "（SOCKS5 127.0.0.1:" + _settings.SshSocksPort + "）"
+                    : "SSH 代理已关闭。");
+            }
         }
 
         // ------------------------------------------------------------- detection

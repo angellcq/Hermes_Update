@@ -207,6 +207,15 @@ namespace HermesInstaller.Core
             }
         }
 
+        /// <summary>E13：外部探测（git 传输层）给出的强制级。只改内存，调用方负责 SaveCooldowns。</summary>
+        public void ForceLevel(EndpointGroup group, int level, string reason)
+        {
+            lock (_gate)
+            {
+                SetLevel(group, level, reason);
+            }
+        }
+
         /// <summary>
         /// 组内探针优胜者：先按「级最低、同级延迟最低」取官方优先的结果；若该结果超过
         /// SlowLatencyMs 且存在可用的更高级端点，则改取最快的高级端点（GitHub 慢 → 镜像）。

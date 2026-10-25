@@ -19,6 +19,11 @@ namespace HermesInstaller.Core
         private readonly Logger _logger;
         private readonly NetworkPlanner _planner;
 
+        /// <summary>E13：git 传输自愈覆盖（清死代理 / 换证书后端），由 GitTransportProbe 探测得出。
+        /// 只作用于本工具派生的子进程，不写用户全局 git 配置。</summary>
+        private Dictionary<string, string> _gitOverrides =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         public NetworkPreparer(Settings settings, Logger logger)
             : this(settings, logger, null)
         {
@@ -29,6 +34,33 @@ namespace HermesInstaller.Core
             _settings = settings ?? new Settings();
             _logger = logger;
             _planner = planner != null ? planner : new NetworkPlanner(_logger, _settings);
+        }
+
+        /// <summary>
+        /// E13：登记 git 传输自愈覆盖（键 = git config key，值 = 覆盖值）。
+        /// 由 InstallerEngine 在操作前的 GitTransportProbe 里取得；随后每次
+        /// BuildEnvironment 都会把它连同 insteadOf 一起注入 GIT_CONFIG_*。
+        /// </summary>
+        public void ApplyGitTransportOverrides(IDictionary<string, string> overrides)
+        {
+            var copy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (overrides != null)
+            {
+                foreach (KeyValuePair<string, string> pair in overrides)
+                {
+                    copy[pair.Key] = pair.Value;
+                }
+            }
+            _gitOverrides = copy;
+            if (copy.Count > 0 && _logger != null)
+            {
+                var parts = new List<string>();
+                foreach (KeyValuePair<string, string> pair in copy)
+                {
+                    parts.Add(pair.Key + "=" + (string.IsNullOrEmpty(pair.Value) ? "(空)" : pair.Value));
+                }
+                _logger.Info("[NET] git 传输覆盖已登记（仅作用于本工具子进程）: " + string.Join("; ", parts.ToArray()));
+            }
         }
 
         public Dictionary<string, string> BuildEnvironment()
@@ -72,6 +104,10 @@ namespace HermesInstaller.Core
             env["PYTHONIOENCODING"] = "utf-8";
 
             ApplyGitDepsRewrite(env);
+
+            // E14：SSH 代理启用时，所有子进程（git/npm/pip/electron/install.ps1）统一走本地
+            // HTTP→SOCKS5 桥。未启用时 ApplyToEnvironment 什么也不做。
+            ProxyRuntime.ApplyToEnvironment(env);
 
             try
             {
@@ -117,49 +153,81 @@ namespace HermesInstaller.Core
         /// https://github.com/ 前缀改写到该组当前级端点（如
         /// https://ghproxy.net/https://github.com/）。级为 0 时一个键都不注入，
         /// 让 git 直连。只进环境变量，绝不碰 .gitconfig。
+        /// E13：与传输自愈覆盖合并成一次 GIT_CONFIG_COUNT 写入（否则两拨会互相覆盖）。
         /// </summary>
         private void ApplyGitDepsRewrite(Dictionary<string, string> env)
         {
+            var entries = new List<KeyValuePair<string, string>>();
+
             int level = _planner.CurrentLevel(EndpointGroup.GitDeps);
             string mirror = LevelEndpointUrl(EndpointGroup.GitDeps);
-            if (level < 1 || string.IsNullOrWhiteSpace(mirror))
+            if (level >= 1 && !string.IsNullOrWhiteSpace(mirror))
             {
-                return;
+                entries.Add(new KeyValuePair<string, string>(
+                    "url." + mirror + ".insteadOf", "https://github.com/"));
             }
-            env["GIT_CONFIG_COUNT"] = "1";
-            env["GIT_CONFIG_KEY_0"] = "url." + mirror + ".insteadOf";
-            env["GIT_CONFIG_VALUE_0"] = "https://github.com/";
+
+            foreach (KeyValuePair<string, string> pair in _gitOverrides)
+            {
+                entries.Add(pair);
+            }
+
+            GitConfig.Apply(env, entries);
         }
 
         /// <summary>
-        /// 单组取值（E12-①，2026-10-25 14:10 事故）：
-        ///   1) planner 当前级 &gt; 0（探针/传输已判定要降级）→ 用该级端点；
-        ///   2) Settings 里非空 → 直接采纳。E12 之前这里还要求「异于内置默认」才算用户手填，
-        ///      而探针 AutoPick 选出的结果恰好就是内置默认值（npmmirror），于是被判成
-        ///      「没设置」→ 落回 planner 的 L0 = GitHub 官方直连，探针结论被自己丢掉。
-        ///   3) 空值 → planner 当前级（含 L0）端点；
-        ///   4) 组内没有该级端点 → 内置默认。
+        /// 单组取值（E12-① + E13 跨环境语义）：
+        ///   1) Settings 里的地址若**不在内置端点表内**（用户自填的内部源/私有镜像）→ 无条件采信；
+        ///   2) 其余情况一律由 planner 当前级端点决定——planner 现在由操作前探针驱动，
+        ///      所以「哪台机器该走官方、哪台该走镜像」是实测出来的，而不是写死的区域假设；
+        ///   3) planner 该级无端点 → 设置值 → 内置默认。
+        /// 背景：E12 之前的判据是「异于内置默认才算用户手填」，而探针 AutoPick 的结果恰好
+        /// 等于内置默认（npmmirror），被判成"没设置"后回落到 planner 的 L0——当时 planner
+        /// 是死代码、恒 L0，于是直接走 GitHub 直连（2026-10-25 14:10 卡死事故）。
+        /// 现在 planner 活了，这条回落语义才是正确的；同时保留"表外自定义源优先"。
         /// </summary>
         private string Resolve(EndpointGroup group, string settingValue, string fallback)
         {
-            if (_planner.CurrentLevel(group) > 0)
-            {
-                string downgraded = LevelEndpointUrl(group);
-                if (!string.IsNullOrWhiteSpace(downgraded))
-                {
-                    return downgraded;
-                }
-            }
-            if (!string.IsNullOrWhiteSpace(settingValue))
+            if (!string.IsNullOrWhiteSpace(settingValue) && !IsKnownEndpoint(group, settingValue))
             {
                 return settingValue.Trim();
             }
+
             string byLevel = LevelEndpointUrl(group);
             if (!string.IsNullOrWhiteSpace(byLevel))
             {
                 return byLevel;
             }
+
+            if (!string.IsNullOrWhiteSpace(settingValue))
+            {
+                return settingValue.Trim();
+            }
             return fallback;
+        }
+
+        /// <summary>该组的已知端点里是否有这个地址（忽略大小写与尾部斜杠）。</summary>
+        private static bool IsKnownEndpoint(EndpointGroup group, string url)
+        {
+            string trimmed = url.Trim();
+            List<NetworkEndpoint> endpoints = Mirrors.GroupsFor(group);
+            for (int i = 0; i < endpoints.Count; i++)
+            {
+                if (NormalizeUrl(endpoints[i].Url) == NormalizeUrl(trimmed))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static string NormalizeUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+            {
+                return string.Empty;
+            }
+            return url.Trim().TrimEnd('/').ToLowerInvariant();
         }
 
         /// <summary>

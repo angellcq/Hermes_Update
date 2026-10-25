@@ -96,6 +96,16 @@ namespace HermesInstaller.Core
         /// <summary>Appends the tail of an external Hermes log, redacted, as a bracketed block.</summary>
         public void AppendExternalLog(string title, string path, int maxLines = 200)
         {
+            AppendExternalLog(title, path, DateTime.MinValue, maxLines);
+        }
+
+        /// <summary>
+        /// E13：只附录 <paramref name="sinceUtc"/> 之后的尾部行。Hermes 的 bootstrap.log
+        /// 是跨月累积的（2026-10-25 的事故日志里贴进了 09-29 的 SOCKS 报错，纯误导），
+        /// 所以默认按本轮操作时间窗过滤；文件 mtime 早于时间窗时整体跳过并注明。
+        /// </summary>
+        public void AppendExternalLog(string title, string path, DateTime sinceUtc, int maxLines)
+        {
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
                 return;
@@ -103,12 +113,30 @@ namespace HermesInstaller.Core
 
             try
             {
+                var fileInfo = new FileInfo(path);
+                if (sinceUtc > DateTime.MinValue && fileInfo.LastWriteTimeUtc < sinceUtc.AddMinutes(-2))
+                {
+                    Write(LogLevel.Info, string.Format(
+                        "----- {0} ({1}) 本轮无新增，已跳过（最后写入 {2:yyyy-MM-dd HH:mm:ss}）-----",
+                        title, path, fileInfo.LastWriteTime));
+                    return;
+                }
+
                 string[] lines = File.ReadAllLines(path);
                 int start = Math.Max(0, lines.Length - maxLines);
                 Write(LogLevel.Info, "----- " + title + " (" + path + ") -----");
+                int appended = 0;
                 for (int i = start; i < lines.Length; i++)
                 {
-                    Write(LogLevel.Info, lines[i]);
+                    if (!string.IsNullOrEmpty(lines[i]))
+                    {
+                        Write(LogLevel.Info, lines[i]);
+                        appended++;
+                    }
+                }
+                if (appended == 0)
+                {
+                    Write(LogLevel.Info, "(空)");
                 }
                 Write(LogLevel.Info, "----- " + title + " end -----");
             }

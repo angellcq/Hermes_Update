@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -44,6 +44,9 @@ namespace HermesInstaller.Core
         }
         private readonly ServiceStateGuard _serviceGuard;
         private readonly RunStateStore _runState;
+
+        /// <summary>E13：本轮操作开始时刻。给「外部日志附录」划时间窗用，避免贴进陈年旧日志。</summary>
+        private DateTime _operationStartedAt = DateTime.MinValue;
 
         public InstallerEngine(Settings settings, Logger logger)
         {
@@ -144,6 +147,13 @@ namespace HermesInstaller.Core
 
                 string plan = FormatPlan();
                 _logger.Info("[NET] 探测结论: " + plan);
+
+                // E13：HTTP 探针通过 ≠ git 能跑（两者代理/证书来源不同）。这里用 git 自己
+                // 探仓库可达性：能用就原样；传输层故障则走通用自愈阶梯；都不行才退镜像。
+                await ProbeGitTransportAsync(cancellationToken).ConfigureAwait(false);
+                _planner.SaveCooldowns();
+                _logger.Info("[NET] 传输结论: " + FormatPlan());
+
                 return plan;
             }
             catch (OperationCanceledException)
@@ -154,6 +164,37 @@ namespace HermesInstaller.Core
             {
                 _logger.Warn("[NET] 操作前网络探测失败，沿用设置中的镜像: " + ex.Message);
                 return "未探测（" + ex.Message + "）";
+            }
+        }
+
+        /// <summary>
+        /// E14：按配置起 SSH 代理（镜像与直连都不可用时的最后通道）。
+        /// 起点在网络探针之前——探针本身就该走代理，否则「探针失败 → 判定全灭」的
+        /// 结论会把可用的出口浪费掉。起不来只 Warn，不阻塞操作。
+        /// </summary>
+        private async Task EnsureSshProxyAsync(CancellationToken cancellationToken)
+        {
+            if (!_settings.SshProxyEnabled)
+            {
+                return;
+            }
+            try
+            {
+                bool ok = await ProxyRuntime
+                    .EnsureStartedAsync(_settings, _logger, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!ok)
+                {
+                    _logger.Warn("[PROXY] SSH 代理启动失败（" + ProxyRuntime.LastError + "），本轮按直连继续。");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[PROXY] SSH 代理启动异常（按直连继续）: " + ex.Message);
             }
         }
 
@@ -173,6 +214,70 @@ namespace HermesInstaller.Core
             return sb.ToString();
         }
 
+        /// <summary>
+        /// E13（2026-10-25 15:36 事故）：git 传输层探测。HTTP 探针成功不代表 git 能用——
+        /// 事故现场 .NET HttpClient 直连 github 拿到 200，而 git 子进程因本机残留的
+        /// http.&lt;host&gt;.proxy（端口早已关闭）+ 指向缺失文件的 sslcainfo，ls-remote 直接 128，
+        /// 于是 hermes update 报「No published stable release could be verified」。
+        /// 做法：按 Repo 组的端点顺序（官方 → 镜像）用 git 实测，第一个能通的即为本轮路径；
+        /// L0 通则登记「通用自愈覆盖」（仅注入子进程），L1 通则把 Repo/GitDeps 降级到镜像。
+        /// 一条都不通才报 Error（此时 update 必然失败，日志里给足原因）。
+        /// </summary>
+        private async Task ProbeGitTransportAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var probe = new GitTransportProbe(_logger, _runner);
+                List<NetworkEndpoint> endpoints = Mirrors.GroupsFor(EndpointGroup.Repo);
+                string lastError = null;
+
+                for (int i = 0; i < endpoints.Count; i++)
+                {
+                    NetworkEndpoint endpoint = endpoints[i];
+                    GitTransportResult result = await probe.ProbeAsync(endpoint.Url, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!result.Ok)
+                    {
+                        lastError = result.Diagnostic;
+                        continue;
+                    }
+
+                    _network.ApplyGitTransportOverrides(result.Overrides);
+
+                    // git 实测是 git 通道的唯一权威信号：它说哪级能通，就用哪级——
+                    // 既能降级（官方不通→镜像），也能回级（HTTP 探针嫌官方"慢"、但 git 实际可用）。
+                    _planner.ForceLevel(EndpointGroup.Repo, endpoint.Level,
+                        "git 实测: " + endpoint.Id + " 可用");
+                    _planner.ForceLevel(EndpointGroup.GitDeps, endpoint.Level,
+                        "git 实测: " + endpoint.Id + " 可用");
+
+                    if (endpoint.Level > 0)
+                    {
+                        _logger.Warn(string.Format(
+                            "[NET] git 实测：{0} 不通（{1}），改用 {2}（{3}）",
+                            endpoints[0].Id, lastError ?? "未知", endpoint.Id, endpoint.Url));
+                    }
+                    else
+                    {
+                        _logger.Info(string.Format("[NET] git 实测：{0} 可用（{1}，{2}ms）",
+                            endpoint.Id, result.Mode, result.LatencyMs));
+                    }
+                    return;
+                }
+
+                _logger.Error("[NET] git 实测：所有仓库端点都不可用（" + (lastError ?? "未知")
+                    + "）。本轮 update 很可能失败，请检查 git 代理/证书配置。");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[NET] git 传输探测异常（不影响主流程，按 probe 结论继续）: " + ex.Message);
+            }
+        }
+
         // ---------------------------------------------------------------- install
 
         public async Task<OperationResult> RunInstallAsync(
@@ -184,6 +289,7 @@ namespace HermesInstaller.Core
             try
             {
                 DateTime startedAt = DateTime.Now;
+                _operationStartedAt = startedAt.ToUniversalTime();
                 try { _runState.Begin("安装"); }
                 catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
                 try { _runState.UpdateStage("获取安装脚本"); }
@@ -191,6 +297,7 @@ namespace HermesInstaller.Core
 
                 // E12-②：先探网络再决定走官方还是镜像（否则 install.ps1 与 Electron 都按
                 // 设置里的默认值直连，GitHub 不通时就是长时间静默等待）。
+                await EnsureSshProxyAsync(cancellationToken).ConfigureAwait(false);
                 await RefreshNetworkPlanAsync(progress, cancellationToken).ConfigureAwait(false);
 
                 Report(progress, 0, 1, "准备", "正在获取官方安装脚本…", false);
@@ -249,6 +356,7 @@ namespace HermesInstaller.Core
             {
                 _runState.Clear();
                 AppendHermesLogs();
+                ProxyRuntime.Stop();
             }
         }
 
@@ -410,6 +518,7 @@ namespace HermesInstaller.Core
             try
             {
                 DateTime startedAt = DateTime.Now;
+                _operationStartedAt = startedAt.ToUniversalTime();
                 try { _runState.Begin("升级"); }
                 catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
                 if (!HermesPaths.CliLauncherPresent)
@@ -422,6 +531,8 @@ namespace HermesInstaller.Core
                 // best-effort：任何失败只落日志，不阻塞升级（update 中途仍会按原路径重试）。
                 // E12-②：预热之前先探网络——探针结论决定 ELECTRON_MIRROR（L0 慢/不通就切镜像），
                 // 预热的键与 update 现场查询的键因此保持一致。
+                // E14：探针之前先起 SSH 代理（若启用），让探针本身就走代理测速。
+                await EnsureSshProxyAsync(cancellationToken).ConfigureAwait(false);
                 await RefreshNetworkPlanAsync(progress, cancellationToken).ConfigureAwait(false);
 
                 try { _runState.UpdateStage("依赖预热"); }
@@ -637,6 +748,7 @@ namespace HermesInstaller.Core
             {
                 _runState.Clear();
                 AppendHermesLogs();
+                ProxyRuntime.Stop();
             }
         }
 
@@ -1018,12 +1130,18 @@ namespace HermesInstaller.Core
             });
         }
 
+        /// <summary>
+        /// 追加 Hermes 侧日志尾部。E13：Hermes 的 bootstrap.log 跨月累积，整段贴会带进
+        /// 与本次无关的旧报错（10-25 的日志里出现了 09-29 的 SOCKS 失败），所以按
+        /// 「本轮开始前 2 分钟」起算，且文件本轮没再写过就只留一行说明。
+        /// </summary>
         private void AppendHermesLogs()
         {
             try
             {
-                _logger.AppendExternalLog("Hermes install.log", HermesPaths.InstallLog, 120);
-                _logger.AppendExternalLog("Hermes bootstrap.log", HermesPaths.BootstrapLog, 80);
+                DateTime since = _operationStartedAt;
+                _logger.AppendExternalLog("Hermes install.log", HermesPaths.InstallLog, since, 120);
+                _logger.AppendExternalLog("Hermes bootstrap.log", HermesPaths.BootstrapLog, since, 80);
             }
             catch { }
         }

@@ -57,6 +57,13 @@ namespace HermesInstaller.Core
         public static string SettingsPath { get { return Path.Combine(AppDataDir, "settings.json"); } }
         public static string LogDirectory { get { return Path.Combine(AppDataDir, "logs"); } }
 
+        // E14：SSH 代理（SOCKS5 隧道）的私钥/askpass 落地目录，只放本机当前用户可读的文件。
+        public static string SshDir { get { return Path.Combine(AppDataDir, "ssh"); } }
+        public static string SshKeyPath { get { return Path.Combine(SshDir, "hermes_proxy_ed25519"); } }
+        public static string SshAskPassPath { get { return Path.Combine(SshDir, "askpass.cmd"); } }
+        public static string SshPasswordFile { get { return Path.Combine(SshDir, "askpass.pw"); } }
+        public static string SshTunnelLog { get { return Path.Combine(StateDir, "ssh-tunnel.log"); } }
+
         // G9（T-HU-DEV-3）：本工具自己的运行状态目录，不耐 Hermes 安装根。
         public static string StateDir { get { return Path.Combine(AppDataDir, "state"); } }
         public static string FingerprintPath { get { return Path.Combine(StateDir, "fingerprint.json"); } }
@@ -101,6 +108,7 @@ namespace HermesInstaller.Core
             Directory.CreateDirectory(CacheDir);
             Directory.CreateDirectory(LogDirectory);
             Directory.CreateDirectory(StateDir);
+            Directory.CreateDirectory(SshDir);
         }
     }
 }

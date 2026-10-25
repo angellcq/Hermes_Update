@@ -426,6 +426,19 @@ namespace HermesInstaller.Core
         /// <summary>builder 工具集预热摘要句，无数需要时返回 null。</summary>
         private async Task<string> WarmBuilderToolsetsAsync(CancellationToken cancellationToken)
         {
+            // E13（跨环境红线）：工具集文件名与 sha256 是 app-builder-lib 26.x 的考古结论，
+            // 换到别的 electron-builder 大版本就是错的假设。所以先读本机装的是哪一版，
+            // 不在已知范围就整段跳过，交给 electron-builder 自己下载——宁可少预热，
+            // 也不把某一版的事实写死成对所有环境都成立。
+            string builderVersion = ReadInstalledBuilderLibVersion();
+            if (builderVersion != null && !builderVersion.StartsWith("26.", StringComparison.Ordinal))
+            {
+                _logger.Info(string.Format(
+                    "[PREFETCH-BUILDER] 本机 app-builder-lib {0} 不在已知预热范围（26.x），跳过工具集预热（build 时会自行下载）。",
+                    builderVersion));
+                return null;
+            }
+
             string builderBase;
             try
             {
@@ -564,6 +577,29 @@ namespace HermesInstaller.Core
             {
                 notes.Add(fileName + " 预热失败: " + ex.Message);
                 _logger.Warn("[PREFETCH-BUILDER] " + fileName + " 预热失败（不影响升级）: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 读本机安装的 app-builder-lib 版本（electron-builder 的核心包）；读不到返回 null
+        /// （读不到就不做版本闸门，按原有 best-effort 走）。
+        /// </summary>
+        private static string ReadInstalledBuilderLibVersion()
+        {
+            try
+            {
+                string path = Path.Combine(HermesPaths.InstallDir, "node_modules", "app-builder-lib", "package.json");
+                string text = TryReadFile(path);
+                if (string.IsNullOrEmpty(text))
+                {
+                    return null;
+                }
+                string version = FirstQuotedValue(text, "version", null);
+                return string.IsNullOrEmpty(version) ? null : version.Trim();
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -1072,7 +1108,8 @@ namespace HermesInstaller.Core
                         "git.exe",
                         "-C " + ProcessRunner.QuoteArg(repo) +
                         " merge-base --is-ancestor refs/remotes/origin/main refs/remotes/upstream/main",
-                        repo, null, null, cancellationToken, null, RetryPolicy.For(OperationClass.GitFetch)).ConfigureAwait(false);
+                        repo, BuildGitEnvironment(), null, cancellationToken, null,
+                        RetryPolicy.For(OperationClass.GitFetch)).ConfigureAwait(false);
                     if (ancestor.ExitCode != 0)
                     {
                         // 与 hermes 同口径：分叉时不 pre-force，让 update 自行处理。
@@ -1088,7 +1125,9 @@ namespace HermesInstaller.Core
                 // 的凭证等待挂住 3+ 分钟）：禁终端/askpass 提示 + 低速率中止，让该推送
                 // 以"GCM 默默无凭证 → Repository Not Found → 快速失败"预期路径收场
                 // （推送失败对 update 是非致命旁路，hermes 自行兜底）。
-                var pushEnv = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                // E13：在镜像/代理/证书环境之上叠加这些防挂死项。
+                Dictionary<string, string> pushEnv = BuildGitEnvironment()
+                    ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 pushEnv["GIT_TERMINAL_PROMPT"] = "0";
                 pushEnv["GCM_INTERACTIVE"] = "never";
                 pushEnv["GIT_ASKPASS"] = "echo";
@@ -1142,10 +1181,45 @@ namespace HermesInstaller.Core
             ProcessResult result = await _runner.RunProcessAsync(
                 "git.exe",
                 "-C " + ProcessRunner.QuoteArg(repo) + " " + args.Trim(),
-                repo, null, null, cancellationToken, null, RetryPolicy.For(OperationClass.GitFetch)).ConfigureAwait(false);
+                repo, BuildGitEnvironment(), null, cancellationToken, null,
+                RetryPolicy.For(OperationClass.GitFetch)).ConfigureAwait(false);
             return result.ExitCode == 0 && !string.IsNullOrEmpty(result.StandardOutput)
                 ? result.StandardOutput.Trim()
                 : null;
+        }
+
+        /// <summary>
+        /// E13：给 git 子进程用的环境 = 镜像/代理/证书覆盖（NetworkPreparer 统一推导）。
+        /// 网络不可用时退回空表（只继承进程环境，至少不比以前更差）。
+        /// </summary>
+        private Dictionary<string, string> BuildGitEnvironment()
+        {
+            if (_network == null)
+            {
+                return null;
+            }
+            try
+            {
+                return _network.BuildEnvironment();
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[GIT] 构建 git 环境失败，退回进程默认环境: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>取异常/输出文本的首行（日志里不贴整段 stderr）。</summary>
+        private static string FirstLine(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return "无 stderr";
+            }
+            string trimmed = text.Trim();
+            int newline = trimmed.IndexOfAny(new[] { '\r', '\n' });
+            string first = newline > 0 ? trimmed.Substring(0, newline) : trimmed;
+            return first.Length > 200 ? first.Substring(0, 200) + "…" : first;
         }
 
         private static string TruncateText(string text, int max)
@@ -1170,6 +1244,9 @@ namespace HermesInstaller.Core
                 return null;
             }
             var options = RetryPolicy.For(OperationClass.GitFetch);
+            // E13：git 必须用「修好的传输环境」（清死代理/换证书后端 + 镜像 insteadOf），
+            // 否则这一路的失败原因只有一句退出码，排查不到真正的地雷。
+            Dictionary<string, string> gitEnv = BuildGitEnvironment();
             foreach (string remote in new[] { "upstream", "origin" })
             {
                 try
@@ -1177,18 +1254,18 @@ namespace HermesInstaller.Core
                     ProcessResult fetch = await _runner.RunProcessAsync(
                         "git.exe",
                         "-C " + ProcessRunner.QuoteArg(repo) + " fetch --quiet --no-tags " + remote + " main",
-                        repo, null, null, cancellationToken, null, options).ConfigureAwait(false);
+                        repo, gitEnv, null, cancellationToken, null, options).ConfigureAwait(false);
                     if (fetch.ExitCode != 0)
                     {
-                        _logger.Info(string.Format("[PREFETCH] git fetch {0} main 失败（退出码 {1}），换下一个来源。",
-                            remote, fetch.ExitCode));
+                        _logger.Info(string.Format("[PREFETCH] git fetch {0} main 失败（退出码 {1}）: {2}；换下一个来源。",
+                            remote, fetch.ExitCode, FirstLine(fetch.StandardError)));
                         continue;
                     }
 
                     ProcessResult show = await _runner.RunProcessAsync(
                         "git.exe",
                         "-C " + ProcessRunner.QuoteArg(repo) + " show " + remote + "/main:package-lock.json",
-                        repo, null, null, cancellationToken, null, options).ConfigureAwait(false);
+                        repo, gitEnv, null, cancellationToken, null, options).ConfigureAwait(false);
                     if (show.ExitCode != 0 || string.IsNullOrEmpty(show.StandardOutput))
                     {
                         continue;

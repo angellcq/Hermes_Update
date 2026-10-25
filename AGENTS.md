@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E12 修复后 23 个 C# 文件 / 9,157 行（`splitlines` 口径，排除 bin/obj）/ 902 节点 / 2,653 边 / DB 3.14MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E14（SSH 代理）交付后 30 个 C# 文件 / 12,672 行（`splitlines` 口径，排除 bin/obj）/ 1,163 节点 / 3,177 边 / DB 4.00MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -25,7 +25,7 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 
 ## 3. 目录结构（括号内为 行数 / 符号数 / 被依赖文件数）
 
-行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；**E7 升级预热交付后 23 个文件合计 7,831 行 / 856 节点**。扣掉 file/namespace/import 后的真实声明：method 279、property 160、field 115、class 51、constant 28、enum 8、enum_member 44。
+行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；**当前（E14 交付后）30 个文件合计 12,672 行 / 1,163 节点**。扣掉 file/namespace/import 后的真实声明：method 383、property 189、field 213、class 61、constant 45、enum 8、enum_member 44。
 
 **M1（2026-10-24）新增的 7 个 Core 文件（共 2,060 行 / 214 符号）**——下列目录树为 M1 前的结构，新文件已并入 `Core/`：
 
@@ -39,7 +39,7 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 | `Core/RunStateStore.cs` | 379 | 40 | `state\run.json` 生命周期，供第二实例读取进度 |
 | `Core/UiTextBuilder.cs` | 145 | 14 | 结论/断言行/多根摘要等文案生成（不引 WinForms） |
 
-**既有文件符号数变化**（M1 后）：`InstallerEngine` 42→52、`ProcessRunner` 25→38、`Models` 89→97、`HermesPaths` 26→30、`MainForm` 102→103。`MainForm.cs` 行数 1,310→**1,345**（NFR-09 预算 ≤1,355）。
+**既有文件符号数变化**（M1 后）：`InstallerEngine` 42→52、`ProcessRunner` 25→38、`Models` 89→97、`HermesPaths` 26→30、`MainForm` 102→103。`MainForm.cs` 行数 1,310→**1,345**（NFR-09 预算 ≤1,355）；E14 后该文件被设计器化重构拆成 `MainForm.cs`（892 行）+ `MainForm.Designer.cs`（1,285 行）。
 
 **E7（2026-10-25）新增的 1 个 Core 文件（升级预热）**：
 
@@ -65,6 +65,17 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 | ④ | **跨键复用**：目标缓存键没有该 zip 时，检查同版本在其它基址键（本次 base / npmmirror / GitHub 官方）下是否已有成品，sha256 通过就硬链接过去（失败退化为复制）。实测：npmmirror 键 `0a74c7b0…` 已有 151MB 成品 → 4 秒校验通过 → 硬链接进原本为空的 GitHub 键 `902aaaf9…`，零重下；整轮预热 47 秒（原 40 分钟未完成） | `DependencyPrefetcher.cs:184`（`TryAdoptFromAlternateKey`） |
 
 配套：删掉 `Settings.PreferDirectL0` / `Settings.EnableL1` 两个**全仓零引用**的死开关（旧 settings.json 里残留同名键由 DataContract 忽略）。当前基线：23 文件 / 9,157 行 / 902 节点 / 2,653 边；`DependencyPrefetcher` 942→1,215 行、`InstallerEngine` 1,045→1,117 行、`NetworkPlanner` 598→725 行、`NetworkPreparer` 205→217 行、`Settings` 89→92 行、`Mirrors` 171→177 行、`Models` 223→230 行、`NetworkProbe` 183→185 行（splitlines 实测）。
+
+**E14（2026-10-25，SSH 代理）新增的 4 个文件（共 1,709 行 / 146 符号，含后续 Designer 拆分）**：镜像与直连同时不可用时的最后一条出网通道。已用真实跳板机（`root@154.219.111.142`）全链路冒烟：自动装公钥 → 密钥登录 → SOCKS5 → HTTP 桥 → 出口 IP 回显 / google 204 / `curl -x` 明文 200 / `git ls-remote` / `npm view` 全部通过。
+
+| 文件 | 行数 | 符号 | 职责 |
+|---|---|---|---|
+| `Core/SshProxyTunnel.cs` | 712 | 54 | 起 `ssh -N -D 127.0.0.1:<socksPort>` 隧道（Win10 自带 OpenSSH；PATH → `%WINDIR%\System32\OpenSSH\ssh.exe`）。密钥引导：`ssh-keygen -t ed25519 -N ""` 生成一次性私钥到 `%LOCALAPPDATA%\HermesInstaller\ssh\hermes_proxy_ed25519`；先用 `BatchMode=yes` 试密钥，失败且有密码则用 askpass 登录并把公钥幂等追加进 `~/.ssh/authorized_keys`（`grep -qF … || echo … >>`），再复测密钥。**askpass 用 `.cmd` 实测可行**（Win32-OpenSSH 9.5 能直接执行 batch，不需要额外 exe），脚本内容 `type <密码文件>`——用 `type` 而非 `echo`，避免密码里的 `& | < > ^ %` 被 batch 解释；密码文件用完即删。密码本身不进 ssh 命令行、不进日志。健康检查 = SOCKS5 握手（05 01 00 → 05 ??），20s 就绪窗口；`Exited` 事件自动重连最多 3 次（3s×次数退避，计数只在 `StartAsync` 归零）；端口已有可用 SOCKS 时直接复用（防上次崩溃残留导致二次绑定失败） |
+| `Core/LocalSocksHttpProxy.cs` | 473 | 39 | 最小 HTTP→SOCKS5 桥。**原因**：.NET Framework 的 HttpClient/HttpWebRequest 只认 HTTP 代理（SOCKS 支持是 .NET 6+），而 in-process 探针/install.ps1 下载/Electron 预热全是 HttpClient。CONNECT（HTTPS）与绝对 URI 的 GET（明文 HTTP）两条分支；后者的头块结尾空行是**必须**的（漏掉时源站一直等，curl 实测「Empty reply from server」，已修）。SOCKS5 握手一律用域名寻址（atype=0x03 = socks5h 语义，DNS 也在对端解析）；只监听 127.0.0.1，无鉴权 |
+| `Core/ProxyRuntime.cs` | 282 | 26 | 进程级单例（一次操作 = 一个生命周期）：`EnsureStartedAsync` 起隧道 + 桥 → 设 `WebRequest.DefaultWebProxy`（.NET Framework 的 HttpClientHandler 在 Proxy 为 null 时读它，一处覆盖全部 in-process HttpClient）→ `ApplyToEnvironment` 把 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY=socks5h://…`（大小写各一份）/`NO_PROXY`/`npm_config_proxy`/`npm_config_https_proxy`/`ELECTRON_GET_USE_PROXY=1`/`GLOBAL_AGENT_HTTP(S)_PROXY` 灌进子进程环境 → `Stop()` 停桥停隧道并**恢复原默认代理**。`TestExitIp()` 经桥取 `https://api.ipify.org` 供 UI/CLI 冒烟 |
+| `Ui/ProxyForm.cs` + `Ui/ProxyForm.Designer.cs` | 147 + 265 | 16 + 23 | 独立对话框（不往 MainForm 继续堆控件）：启用开关、主机/SSH 端口/用户名/密码/SOCKS 端口、测试连接（真起隧道取出口 IP 后立即收摊）、保存（写回 Settings，密码走 DPAPI）。Designer 由后续 WinForms 设计器化重构拆出，`ProxyForm.resx` 非本功能引入 |
+
+**既有文件相关变化（E14 后）**：`Settings.cs` 92→167 行（6 个 `[DataMember]`：`sshProxyEnabled`（默认 false）、`sshHost`、`sshPort`（22）、`sshUser`（root）、`sshSocksPort`（1080）、`sshHttpPort`（1081）、`sshPasswordProtected`；密码用 `ProtectedData.Protect(…, CurrentUser)` 存 Base64，`GetSshPassword()` 解不开返回空串不抛异常）；`HermesPaths.cs` 106→114 行（`SshDir`/`SshKeyPath`/`SshAskPassPath`/`SshPasswordFile`/`SshTunnelLog`，`EnsureAppData` 建 `ssh` 目录）；`NetworkPreparer.cs` 257→285 行（`BuildEnvironment` 末尾调 `ProxyRuntime.ApplyToEnvironment`，未启用时零副作用）；`InstallerEngine.cs` 1,199→1,235 行（新增 `EnsureSshProxyAsync`，在 `RefreshNetworkPlanAsync` **之前**调用——探针本身就该走代理，否则「探针全灭」的结论会把可用出口浪费掉；`RunInstallAsync`/`RunUpgradeAsync` 的 `finally` 各加 `ProxyRuntime.Stop()`）；`Program.cs` 201→309 行（`--ssh-proxy-test` 无 GUI 自检：打印配置/密钥/隧道/出口 IP，支持 `HERMES_SSH_PASSWORD` 临时注入密码、`HERMES_SSH_PROXY_HOLD_SECONDS` 保持隧道供并行验证 curl/git/npm）；`MainForm.cs` 1,345→**892** 行 + `MainForm.Designer.cs` **1,285** 行（代理入口 `btnProxy` + `EditProxySettings()` 已随 Wave-1 设计器化重构迁出构建代码；MainForm.cs 本身回到预算内，但「窗体总量」仍是 2,177 行，新 UI 继续放独立窗体）；`HermesInstaller.csproj` 增加 `<Reference Include="System.Security" />`（DPAPI）。
 
 
 ```
@@ -148,6 +159,9 @@ flowchart TD
 依赖被点数（`codegraph` 实测，与上面连线一致）：`Logger` 8、`HermesPaths` 6、`Mirrors` 6、`Models` 5、`Settings` 4、`InstallerEngine`/`EnvironmentProbe`/`HostsFixer`/`NetworkProbe` 各 2、`ProcessRunner`/`NetworkPreparer`/`Redactor` 各 1、`Program` 0（入口，无人调用）。
 `Logger` + `HermesPaths` + `Mirrors` 是改动波及面最大的三个「叶子基建」，改它们等于改全项目。
 
+**E14 新增的代理链路（不改上面三条依赖边，属于可选旁路）**：
+`InstallerEngine.EnsureSshProxyAsync` / `NetworkPreparer.BuildEnvironment` / `Program --ssh-proxy-test` / `Ui.ProxyForm` → `ProxyRuntime`（静态门面）→ `SshProxyTunnel`（起 ssh.exe，引 `Logger`/`HermesPaths`/`Settings`/`ProcessRunner`）+ `LocalSocksHttpProxy`（HTTP→SOCKS5 桥，引 `Logger`）。`ProxyRuntime` 是唯一对外入口，别的类不要直接 new 隧道。
+
 关键路径（`codegraph callers/callees` 实测）：
 
 - **一次操作的完整链路**
@@ -193,12 +207,12 @@ flowchart TD
 ### 5.3 常量与路径
 
 - `Mirrors`：官方端点 `OfficialInstaller`（`hermes-agent.nousresearch.com/install.ps1`）/ `OfficialDownload` / `Github` / `GithubApi` / `RawGithub`；镜像 `ElectronMirror` / `BuilderMirror` / `NpmRegistry`（npmmirror）、`PipIndex`（清华源）；`RepoCandidates` = ghproxy.net → gh-proxy.com → 直连（`repo-0` 标 `Critical`）。`BuildEndpoints()` 拼成 11 条待探测端点；`PickRepoMirror` 取延迟最低，其余 `Pick*` 取首个可用并有默认值兜底。
-- `HermesPaths`：`HermesHome`（`HERMES_HOME` 优先，否则 `%LOCALAPPDATA%\hermes`）→ `InstallDir`=`hermes-agent`、`BinDir`=`bin`、`HermesCmd`=`bin\hermes.cmd`、`LogsDir`=`logs`、`InstallLog`、`BootstrapLog`、`InstallStamp`=`install-stamp.json`、`ConfigFile`=`config.yaml`、`DesktopExe`（`apps\desktop\release\win-unpacked\Hermes.exe`）、`DesktopReleaseDir`；**本工具自己的数据**走另一个根 `AppDataDir`=`%LOCALAPPDATA%\HermesInstaller`（`CacheDir`/`CachedInstallerScript`=`cache\install.ps1`/`SettingsPath`/`LogDirectory`）；再加三个判断 `InstallLooksPresent` / `CliLauncherPresent` / `DesktopBuilt`。
+- `HermesPaths`：`HermesHome`（`HERMES_HOME` 优先，否则 `%LOCALAPPDATA%\hermes`）→ `InstallDir`=`hermes-agent`、`BinDir`=`bin`、`HermesCmd`=`bin\hermes.cmd`、`LogsDir`=`logs`、`InstallLog`、`BootstrapLog`、`InstallStamp`=`install-stamp.json`、`ConfigFile`=`config.yaml`、`DesktopExe`（`apps\desktop\release\win-unpacked\Hermes.exe`）、`DesktopReleaseDir`；**本工具自己的数据**走另一个根 `AppDataDir`=`%LOCALAPPDATA%\HermesInstaller`（`CacheDir`/`CachedInstallerScript`=`cache\install.ps1`/`SettingsPath`/`LogDirectory`/`StateDir`；E14 再挂 `SshDir`=`ssh` → `SshKeyPath`/`SshAskPassPath`/`SshPasswordFile`）；再加三个判断 `InstallLooksPresent` / `CliLauncherPresent` / `DesktopBuilt`。
 - `Logger`：日志目录 `%LOCALAPPDATA%\HermesInstaller\logs`（**不是 AppDataDir 根**），文件名 `<操作名>-<yyyyMMdd-HHmmss>.log`，UTF-8 无 BOM、`AutoFlush=true`，暴露 `Logged` 事件给 UI 实时刷；`AppendExternalLog(title, path, maxLines=200)` 追加官方日志尾部（同样过脱敏）。
 - `HostsFixer`：备份到 `%LOCALAPPDATA%\HermesInstaller\hosts-backups\hosts.bak-<yyyyMMdd-HHmmss>`（`TryBackup(out path)` 失败即放弃写；`RestoreLatestBackup` 取最新一份还原）；`ApplyAsync` 删掉 hosts 里已有的 `github.com` / `raw.githubusercontent.com` 映射后**写入 3 条硬编码 IP**（`185.199.108.133`、`185.199.111.133` → raw.githubusercontent.com，`20.205.243.166` → github.com），再 `ipconfig /flushdns` + `/registerdns`。这些 IP 会过期——「修了 hosts 还是不通」先怀疑这里。`IsHostsBlocked` 以「有 `0.0.0.0` + `raw.githubusercontent.com`」判被污染。
 - 提权方式：app.manifest 是 `asInvoker`（平时不以管理员跑）+ `PerMonitorV2` DPI + `longPathAware`；`MainForm.FixHostsAsync` 检测到非管理员时，用 `Application.ExecutablePath --fix-hosts` + `Verb=runas` 自提权重启一个自身进程，再由 `Program.RunHostsAction(true)` 落地（`--restore-hosts` 走同一个方法，参数 false）。
-- `Settings` 的 12 个字段：`channel`（默认 `stable`）、`skipBrowser`、`skipComputerUse`、`autoDetectMirrors`（默认 `true`）、`repoMirror`、`electronMirror`、`builderMirror`、`npmRegistry`、`pipIndex`、`allowHostsFix`（默认 `false`）、`backupBeforeUpdate`（默认 `false`）、`lastOperation`。`Load()` 任何异常都静默返回默认值，`Save()` 任何异常都静默吞掉——**配置丢了不会报错**，排查只能看 `%LOCALAPPDATA%\HermesInstaller\settings.json` 是否存在。
-- `NetworkPreparer.BuildEnvironment()` 注入 18 个环境变量：`HERMES_REPO_URL`、`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`、`ELECTRON_BUILDER_CACHE`、`npm_config_registry`+`NPM_CONFIG_REGISTRY`、`PIP_INDEX_URL`+`PIP_TRUSTED_HOST`、`UV_DEFAULT_INDEX`+`UV_INDEX_URL`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`、`GIT_ASKPASS=echo`、`GIT_HTTP_LOW_SPEED_LIMIT=1000`、`GIT_HTTP_LOW_SPEED_TIME=30`、`PYTHONUTF8`+`PYTHONIOENCODING`。加变量时两边大小写都要给（npm 就是这么成对的）。后 5 个 git 变量是 E8 防挂死组（见 §3「既有文件相关变化」）：fork 推送无凭证时快速失败而非静默等待 GUI / 180s 预算击杀。
+- `Settings` 的 18 个字段：`channel`（默认 `stable`）、`skipBrowser`、`skipComputerUse`、`autoDetectMirrors`（默认 `true`）、`repoMirror`、`electronMirror`、`builderMirror`、`npmRegistry`、`pipIndex`、`allowHostsFix`（默认 `false`）、`backupBeforeUpdate`（默认 `false`）、`lastOperation`，以及 E14 的 6 个 SSH 代理字段 `sshProxyEnabled`（默认 `false`）、`sshHost`、`sshPort`、`sshUser`、`sshSocksPort`、`sshHttpPort` + `sshPasswordProtected`（DPAPI Base64）。`Load()` 任何异常都静默返回默认值，`Save()` 任何异常都静默吞掉——**配置丢了不会报错**，排查只能看 `%LOCALAPPDATA%\HermesInstaller\settings.json` 是否存在。
+- `NetworkPreparer.BuildEnvironment()` 注入 18 个环境变量：`HERMES_REPO_URL`、`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`、`ELECTRON_BUILDER_CACHE`、`npm_config_registry`+`NPM_CONFIG_REGISTRY`、`PIP_INDEX_URL`+`PIP_TRUSTED_HOST`、`UV_DEFAULT_INDEX`+`UV_INDEX_URL`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`、`GIT_ASKPASS=echo`、`GIT_HTTP_LOW_SPEED_LIMIT=1000`、`GIT_HTTP_LOW_SPEED_TIME=30`、`PYTHONUTF8`+`PYTHONIOENCODING`。加变量时两边大小写都要给（npm 就是这么成对的）。后 5 个 git 变量是 E8 防挂死组（见 §3「既有文件相关变化」）：fork 推送无凭证时快速失败而非静默等待 GUI / 180s 预算击杀。**E14 追加**：SSH 代理启用时再注入 13 个代理变量（`HTTP_PROXY`/`HTTPS_PROXY` 大小写各一份、`ALL_PROXY`=socks5h、`NO_PROXY`、`npm_config_proxy`/`npm_config_https_proxy`、`ELECTRON_GET_USE_PROXY`、`GLOBAL_AGENT_HTTP(S)_PROXY`），未启用时一个都不加。
 
 ## 6. 改动风险（`codegraph impact` 实测，2026-10-24）
 
@@ -224,9 +238,10 @@ flowchart TD
 2. **单文件发布**：目标是「解压双击即用」，不要引入需要额外安装的运行时或 NuGet 依赖。
 3. **默认不动系统文件**：`HostsFixer` 只在「操作因网络失败 + 用户明确点确认」时触发（`RunOperationAsync` 里 `LooksLikeNetworkFailure` 是第一道闸，`OfferHostsFixAsync` 的对话框是第二道）；`ApplyAsync` 内先 `TryBackup()` 再写，备份失败直接放弃，任何改动必须可还原。
 4. **日志脱敏不可绕过**：所有写日志路径必须走 `Logger.Write`，由它调 `Redactor`；别绕开 Logger 直接写文件。
-5. **UI 与 Core 分离**：业务逻辑放 `Core/`，`MainForm.cs` 只做编排与展示——已 1,310 行 / 52.6KB / 90 个声明（50 field、39 method 挤在一个类里），**别再往里堆业务**；新逻辑进 `Core/` 新建文件即可，SDK 风格 csproj 不用登记。
+5. **UI 与 Core 分离**：业务逻辑放 `Core/`，`MainForm.cs`（892 行）+ `MainForm.Designer.cs`（1,285 行，设计器化重构后拆出）只做编排与展示；**新 UI 一律建独立窗体**（参考 `Ui/ProxyForm.cs` + `ProxyForm.Designer.cs`），SDK 风格 csproj 不用登记。
 6. **进程占用**：升级/卸载前必须停掉 `HERMES_HOME` 下的进程（`InstallerEngine.StopHermesProcessesAsync`，按 `Hermes/hermes/python/pythonw` + 路径前缀匹配），否则文件占用失败。
 7. **改完必须过 `build.ps1` 编译**，再真机冒烟。
+8. **SSH 代理只做「最后一条通道」**：默认关闭（`sshProxyEnabled=false`），启用后 `InstallerEngine` 在每次安装/升级开头起隧道、`finally` 里 `Stop()`。密码只在首次装公钥时用一次（askpass `.cmd` + 密码文件，用完即删），之后走 `%LOCALAPPDATA%\HermesInstaller\ssh\hermes_proxy_ed25519` 密钥登录。别把密码写进命令行、别把它打进日志（`Redactor` 不认 SSH 密码形态）。`StrictHostKeyChecking=accept-new` 是**刻意**的（无人值守不能停在 yes/no 提示），代价是首次连接不防中间人。
 
 ## 8. 构建与验证
 
@@ -235,13 +250,14 @@ pwsh -File .\build\build.ps1                     # Release 构建 + 打包（35 
 pwsh -File .\build\build.ps1 -Configuration Debug # 换配置
 ```
 
-**实测基线（2026-10-24 M1 交付后，SDK 10.0.402 / pwsh 可用）**：`dotnet build` 还原 ~140ms、编译 ~2.4–3.5s、**0 警告 0 错误**，产物 `dist/HermesInstaller/HermesInstaller.exe`（**158.5 KB**）+ `dist/HermesInstaller-win-x64.zip`（**76.4 KB**）。M1 前基线为 57 KB。这两个数字就是「改完没破坏构建」的对照基线；出现警告先当成新引入的问题查。
+**实测基线（2026-10-25 E14 交付后，SDK 10.0.402 / pwsh 可用）**：`dotnet build` **0 警告 0 错误**（~2.7s），产物 `dist/HermesInstaller/HermesInstaller.exe`（**280.5 KB**）+ `dist/HermesInstaller-win-x64.zip`（**123.7 KB**）。E14 前基线为 158.5 KB / 76.4 KB。这两个数字就是「改完没破坏构建」的对照基线；出现警告先当成新引入的问题查。
 
 产物验证：exe 能启动、环境探针跑完不崩。
 
 本项目**无单元测试框架**（WinForms 强依赖系统环境），验证以**真机冒烟**为准：
 启动 → 环境探针跑完 → 镜像探测有结果 → 选一个「新装/升级」走通 → 看日志无异常。
 另一个免 GUI 的探路手段：`HermesInstaller.exe --selftest`（`Program.RunSelfTest`，把探针/镜像/清单结果写到 `%TEMP%\hermes-installer-selftest.txt` 并尝试挂控制台输出），只读、不安装。
+SSH 代理单独验证：`HermesInstaller.exe --ssh-proxy-test`（读 settings.json，起隧道 + 桥，打印出口 IP，结果写 `%TEMP%\hermes-ssh-proxy-test.txt`）。密码可用 `HERMES_SSH_PASSWORD` 临时注入（免写盘）；`HERMES_SSH_PROXY_HOLD_SECONDS=90` 可让隧道保持存活，便于并行跑 `curl -x http://127.0.0.1:1081`、`git ls-remote`、`npm view`。
 
 ## 9. 常见坑
 
@@ -255,10 +271,11 @@ pwsh -File .\build\build.ps1 -Configuration Debug # 换配置
 - **E12 起镜像不是恒定的**：`RefreshNetworkPlanAsync` 每次安装/升级都会重新探针，结论写入 `state\network-cooldown.json`（300s 冷却），并直接改变 `ELECTRON_MIRROR` / `HERMES_REPO_URL` / npm / pip。排查「为什么走了/没走镜像」先看这条文件与日志里的 `[NET] 探测结论:` 行；想强制回到官方直连，删掉该 json 即可。
 - 探针探的是**基址 URL**：`electron-0` / `builder-0` 指向 `github.com/.../releases/download/`，该路径对 GET 恒为 404 → 这两组几乎必然被判 L1（镜像），这是预期行为，别当成探测 bug；`repo-0` 探的是真实仓库地址（200），所以仓库仍会优先官方。
 - `network-cooldown.json` 的 Level 会在 300s 冷却后由 `Recover` 回收（目前只由 `CanRecover`/`Recover` 接口提供，暂无自动回级调用点）——长期卡在 L1 先看这个文件的时间戳。
+- **E14 代理相关**：① `ssh.exe` 是 Windows 可选功能「OpenSSH 客户端」，缺了只会 Warn 并回退直连（`--ssh-proxy-test` 第一行就能看出来）；② 端口已有可用 SOCKS5 时 `StartAsync` 会直接复用而不是再绑一次，排查「为什么日志里没有密钥流程」先看这句；③ 密钥装在 `%LOCALAPPDATA%\HermesInstaller\ssh\`，删掉即回到密码登录（下次启用会重新生成并装公钥）；④ `WebRequest.DefaultWebProxy` 是**进程级全局**，`ProxyRuntime.Stop()` 必须在操作结束时调用（`InstallerEngine` 的两个 `finally` 已兜住），否则 UI 后续请求也会绕道代理；⑤ 代理桥只监听 127.0.0.1、无鉴权，别把 `SshHttpPort` 改到对外地址。
 
 ## 10. 代码导航：用 codegraph，别全文搜
 
-索引在 `.codegraph/`（SQLite WAL，当前 3.14MB；自带 `.gitignore` 只保留自身，DB 不入库，但 `git status` 仍会显示 `?? .codegraph/`）。
+索引在 `.codegraph/`（SQLite WAL，当前 4.00MB；自带 `.gitignore` 只保留自身，DB 不入库，但 `git status` 仍会显示 `?? .codegraph/`）。
 
 ```bash
 codegraph status                # 索引是否最新 + 节点构成（先跑这个）
@@ -274,10 +291,11 @@ codegraph explore "<自然语言问题>" # 一次性拉相关上下文 + 调用�
 
 索引机制备忘（照此判读，别乱「修索引」）：
 
-- 当前 `23 files / 902 nodes / 2,653 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`。
-- 节点构成：method 308、property 158、import 126、field 121、class 51、enum_member 44、constant 39、file 23、namespace 23、enum 8。**`import`/`namespace`/`file` 三类共 172 个是结构性噪声**，估工作量时用 729 这个「真实声明数」。
+- 当前 `30 files / 1,163 nodes / 3,177 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`（E14 后 `codegraph sync` 复核：`Index is up to date`，与 §3 基线一致）。
+- 节点构成：method 383、property 189、field 213、import 160、class 61、constant 45、enum_member 44、file 30、namespace 30、enum 8。**`import`/`namespace`/`file` 三类共 220 个是结构性噪声**，估工作量时用 943 这个「真实声明数」。
 - `unresolved_refs` 恒为大量 `status='failed'`——这是 BCL/WinForms 外部符号的常态，不是索引坏了；真正的坏信号是 `project_metadata.index_state <> 'complete'`。
 - 短名符号（`Run`、`Start`、`Write`、`ToString`、属性 getter）的边可能是伪造的跨层链接：拿它当分层结论前，先 `grep` 目标命名空间是否真被 import。
+- 仓库根的 `IDEA.md` 是本地草稿（已列入 `.gitignore` 的「Local scratch」段），**不提交、不参与索引**；`git status` 应保持干净。
 
 <!-- BEGIN hermes-workflow-kit（由 workflow-kit-deploy 维护，勿手改本段） -->
 ## 11. Hermes 开发工作流（按需启用）

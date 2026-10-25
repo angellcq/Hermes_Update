@@ -432,3 +432,7 @@ dist/
 payload/
 /.hermes/
 /.codegraph/
+
+# Local scratch (agent notes, never committed)
+IDEA.md
+/.metaharness/
