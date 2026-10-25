@@ -483,8 +483,7 @@ namespace HermesInstaller.Core
                     }
                 }
 
-                // G3 防重复判定（同一次操作内）：无版本变化则跳过桌面端重建，杜绝 E3/E15 的
-                // 「同一轮升级跑两遍 update/重建」。该判定不落盘、不保留到下一轮——
+                // G3 防重复判定（同一次操作内）：该判定不落盘、不保留到下一轮——
                 // LoadLast 的结果在这里不会被用来提前 return，升级命令每轮都实际执行（D-1）。
                 FingerprintRecord fpAfter = await fingerprint.CaptureAsync(cancellationToken).ConfigureAwait(false);
                 fingerprint.SaveLast(fpAfter);
@@ -493,12 +492,24 @@ namespace HermesInstaller.Core
                     + "（IsSame 仅限本轮操作内比较，跨会话不做指纹跳过——DD 偏差 D-1）");
                 _logger.Info(UiTextBuilder.FingerprintChangedText(versionUnchanged));
 
-                // G8 改造点 5：二次构建条件 = !DesktopBuilt（既有）「或」产物 mtime 未随本轮更新；
-                // 且本轮 update 已无版本变化时不再发起重建（G3 防重复）。
-                if (includeDesktop && !versionUnchanged
-                    && (!HermesPaths.DesktopBuilt || !IsDesktopArtifactFresh(startedAt)))
+                // E11（2026-10-25 13:01 桌面端升级误报）：重建条件不再绑「版本有无变化」，
+                // 改为「产物是否落后于当前代码」：
+                //   • 产物缺失 / mtime 早于 HEAD 提交时间 → 代码比产物新，必须重建
+                //     （用户点「桌面端升级」就是要产物追上代码；此前 !versionUnchanged 的闸门
+                //      让「代码已最新但产物没跟上」的场景永远重建不了，A3 还反过来判失败）；
+                //   • 产物晚于 HEAD 提交时间 → 已经覆盖当前代码，天然防重复
+                //     （update 内部刚构建过时 mtime 必然是新的，无需再补一枪 build-only）。
+                // 拿不到 HEAD 时间时退回旧判据（本轮 mtime），保证不误判、不阻塞。
+                DateTime? codeSyncTime = await GetHeadCommitTimeAsync(cancellationToken).ConfigureAwait(false);
+                bool desktopStale = !HermesPaths.DesktopBuilt
+                    || (codeSyncTime.HasValue
+                        ? !IsDesktopArtifactFreshRelativeTo(codeSyncTime.Value)
+                        : !IsDesktopArtifactFresh(startedAt));
+                if (includeDesktop && desktopStale)
                 {
-                    _logger.Warn("未找到桌面端产物（或产物早于本轮开始时间），单独重建…");
+                    _logger.Warn(codeSyncTime.HasValue
+                        ? "桌面端产物早于当前代码（或缺失），单独重建…"
+                        : "未找到桌面端产物（或产物早于本轮开始时间），单独重建…");
                     try { _runState.UpdateStage("桌面端重建"); }
                     catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                     Report(progress, 0, 1, "桌面端", "正在重建桌面端…", true);
@@ -512,6 +523,12 @@ namespace HermesInstaller.Core
                     {
                         throw new InstallerException("桌面端重建失败。请查看日志。");
                     }
+                }
+                else if (includeDesktop)
+                {
+                    _logger.Info("[G3] 桌面端产物已覆盖当前代码（mtime " +
+                        (HermesPaths.DesktopBuilt ? File.GetLastWriteTime(HermesPaths.DesktopExe).ToString("yyyy-MM-dd HH:mm:ss") : "(缺失)")
+                        + "），本轮不重复重建。");
                 }
 
                 // G5 流程 ⑨：升级收尾按冻结顺序复原网关（ensure → start → 失败降级），
@@ -600,6 +617,65 @@ namespace HermesInstaller.Core
 
         // ---------------------------------------------------------------- helpers
 
+        /// <summary>E11（2026-10-25 13:01 桌面端升级误报）：HEAD 提交时间缓存（一次操作取一次）。</summary>
+        private DateTime? _headCommitTime;
+        private bool _headCommitTimeProbed;
+
+        /// <summary>
+        /// 当前代码的「同步时刻」= git HEAD 提交时间（epoch → 本地时间）。桌面端产物是否够新，
+        /// 应以「是否晚于当前代码」为判据，而不是「本轮操作是否碰过产物」——后者在版本未变、
+        /// G3 跳过重建时必然为假，会把「已是最新」误报成「疑似旧产物」（13:01 事故根因）。
+        /// 与 VersionFingerprint.CaptureGitHeadAsync 同款 Generic 短化实例（总预算 15s）。
+        /// 取不到时返回 null，调用方退回本轮 mtime 判据（不阻塞、不误判）。
+        /// </summary>
+        public async Task<DateTime?> GetHeadCommitTimeAsync(CancellationToken cancellationToken)
+        {
+            if (_headCommitTimeProbed)
+            {
+                return _headCommitTime;
+            }
+            _headCommitTimeProbed = true;
+            try
+            {
+                var options = new ProcessRunOptions
+                {
+                    Class = OperationClass.Generic,
+                    NoProgressTimeout = null,
+                    TotalTimeout = TimeSpan.FromSeconds(15),
+                    PollIntervalMs = 500
+                };
+                string arguments = "-C " + ProcessRunner.QuoteArg(HermesPaths.InstallDir) + " log -1 --format=%ct";
+                ProcessResult result = await _runner.RunProcessAsync(
+                    "git.exe", arguments, HermesPaths.HermesHome, null, null,
+                    cancellationToken, null, options).ConfigureAwait(false);
+                if (result.Cancelled)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+                string line = (result.StandardOutput ?? string.Empty).Trim();
+                long epoch;
+                if (result.ExitCode == 0 && long.TryParse(line, out epoch) && epoch > 0)
+                {
+                    _headCommitTime = DateTimeOffset.FromUnixTimeSeconds(epoch).LocalDateTime;
+                    _logger.Info("[FP] 代码同步时刻（HEAD 提交时间）: " + _headCommitTime.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                }
+                else
+                {
+                    _logger.Warn("[FP] 读取 HEAD 提交时间失败（退出码 " + result.ExitCode + "），退用本轮 mtime 判据。");
+                }
+                return _headCommitTime;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[FP] 读取 HEAD 提交时间异常（退用本轮 mtime 判据）: " + ex.Message);
+                return null;
+            }
+        }
+
         /// <summary>
         /// G8 改造点 5：桌面端产物是否在本轮开始之后被更新过（mtime 粒度按文件系统 2s 内不比较）。
         /// 产物存在且 mtime 已大于 startedAt → 视为 update 刚重建过，无需再补一枪 build-only。
@@ -618,6 +694,25 @@ namespace HermesInstaller.Core
             catch (Exception ex)
             {
                 _logger.Warn("[G8] 读取桌面端产物 mtime 失败，按「产物未更新」处理: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>E11：产物是否已覆盖指定代码时点（HEAD 提交时间；2 分钟容差吸收时钟偏差/检出耗时）。</summary>
+        private bool IsDesktopArtifactFreshRelativeTo(DateTime codeSyncTime)
+        {
+            try
+            {
+                if (!HermesPaths.DesktopBuilt)
+                {
+                    return false;
+                }
+                DateTime mtime = File.GetLastWriteTime(HermesPaths.DesktopExe);
+                return mtime >= codeSyncTime.AddMinutes(-2);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[E11] 读取桌面端产物 mtime 失败，按「需要重建」处理: " + ex.Message);
                 return false;
             }
         }

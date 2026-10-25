@@ -299,6 +299,11 @@ namespace HermesInstaller.Core
         private const string Builder7ZipRelease = "7zip@1.0.0";
         private const string Builder7ZipFile = "7zip-win-x64.tar.gz";
         private const string Builder7ZipSha256 = "be071f15bd6da2f78fe81c6ddef2009b0c4d8a51f36b780cb806c7e6df95e1b3";
+        private const string GithubBuilderBase = "https://github.com/electron-userland/electron-builder-binaries/releases/download/";
+
+        /// <summary>工具集单源下载预算：官方源慢（13:01 实测 winCodeSign 5.6MB 走了 6.5 分钟）
+        /// 时快速切到 npmmirror，避免把升级开工时刻整体拖后。</summary>
+        private static readonly TimeSpan BuilderToolsetTimeout = TimeSpan.FromMinutes(3);
 
         /// <summary>builder 工具集预热摘要句，无数需要时返回 null。</summary>
         private async Task<string> WarmBuilderToolsetsAsync(CancellationToken cancellationToken)
@@ -331,9 +336,16 @@ namespace HermesInstaller.Core
 
             var done = new List<string>();
             var notes = new List<string>();
-            WarmBuilderToolset(builderBase, roots, BuilderWinCodeSignRelease, BuilderWinCodeSignFile,
+            // E10-③ 补强（13:01 实测：L0 官方源 5.6MB 走了 6.5 分钟）：
+            // 工具集内容有官方 sha256 校验、与来源无关，所以按「快源优先」排序——
+            // npmmirror 打头，再试与 env 同路的解析基址，最后 GitHub 官方。
+            var sources = new List<string>();
+            AddSource(sources, Mirrors.BuilderMirror);
+            AddSource(sources, builderBase);
+            AddSource(sources, GithubBuilderBase);
+            WarmBuilderToolset(sources, roots, BuilderWinCodeSignRelease, BuilderWinCodeSignFile,
                 BuilderWinCodeSignSha256, done, notes, cancellationToken);
-            WarmBuilderToolset(builderBase, roots, Builder7ZipRelease, Builder7ZipFile,
+            WarmBuilderToolset(sources, roots, Builder7ZipRelease, Builder7ZipFile,
                 Builder7ZipSha256, done, notes, cancellationToken);
 
             if (done.Count == 0 && notes.Count == 0)
@@ -345,9 +357,9 @@ namespace HermesInstaller.Core
                 : notes[0];
         }
 
-        /// <summary>单工具集：能从任一根命中即休眠完成；否则下载一次并双根落位（先解压根优先）。</summary>
+        /// <summary>单工具集：任一根命中即完成；否则按来源优先级下载并双根落位（同卷硬链接优先）。</summary>
         private void WarmBuilderToolset(
-            string builderBase, List<string> roots, string releaseName, string fileName, string expectedSha256,
+            List<string> sources, List<string> roots, string releaseName, string fileName, string expectedSha256,
             List<string> done, List<string> notes, CancellationToken cancellationToken)
         {
             try
@@ -366,17 +378,42 @@ namespace HermesInstaller.Core
                     }
                 }
 
-                // 2) 未命中 → 下载到第一根（env 目标），随后向其余根种子。
+                // 2) 未命中 → 按快源优先逐个尝试下载到第一根（env 目标），随后向其余根种子。
                 // URL 为字面拼接：builder 侧 = base + releaseName + "/" + filename，@ 不转义。
                 if (canonical == null)
                 {
                     string primaryRoot = roots[0];
                     string primaryDir = Path.Combine(primaryRoot, releaseName);
-                    string url = builderBase + releaseName + "/" + fileName;
-                    DownloadAndPlaceAsync(url, primaryDir, fileName, expectedSha256, cancellationToken)
-                        .GetAwaiter().GetResult();
-                    canonical = Path.Combine(primaryDir, fileName);
-                    _logger.Success(string.Format("[PREFETCH-BUILDER] {0} 预热完成（写入 {1}）", fileName, canonical));
+                    Exception lastError = null;
+                    foreach (string source in sources)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        string url = source + releaseName + "/" + fileName;
+                        try
+                        {
+                            DownloadAndPlaceAsync(url, primaryDir, fileName, expectedSha256,
+                                cancellationToken, BuilderToolsetTimeout).GetAwaiter().GetResult();
+                            canonical = Path.Combine(primaryDir, fileName);
+                            _logger.Success(string.Format("[PREFETCH-BUILDER] {0} 预热完成（源 {1}，写入 {2}）",
+                                fileName, DescribeSource(source), canonical));
+                            break;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            lastError = ex;
+                            _logger.Warn(string.Format("[PREFETCH-BUILDER] 从 {0} 下载 {1} 失败: {2}",
+                                DescribeSource(source), fileName, ex.Message));
+                        }
+                    }
+                    if (canonical == null)
+                    {
+                        throw new InstallerException("所有来源都失败: "
+                            + (lastError != null ? lastError.Message : "未知"));
+                    }
                 }
 
                 // 3) 双根种子（同卷硬链接优先；远处根复制兜底）
@@ -426,7 +463,8 @@ namespace HermesInstaller.Core
 
         /// <summary>下载 zip → 校验 → 原子落位到 keyDir/fileName。校验不一致抛 InstallerException。</summary>
         private async Task DownloadAndPlaceAsync(
-            string url, string keyDir, string fileName, string expected, CancellationToken cancellationToken)
+            string url, string keyDir, string fileName, string expected, CancellationToken cancellationToken,
+            TimeSpan? timeout = null)
         {
             Directory.CreateDirectory(keyDir);
             string temp = Path.Combine(keyDir, fileName + ".prefetch-" + Guid.NewGuid().ToString("N") + ".tmp");
@@ -434,7 +472,7 @@ namespace HermesInstaller.Core
 
             try
             {
-                using (var client = new HttpClient { Timeout = DownloadTimeout })
+                using (var client = new HttpClient { Timeout = timeout.HasValue ? timeout.Value : DownloadTimeout })
                 {
                     using (var response = await client
                         .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)

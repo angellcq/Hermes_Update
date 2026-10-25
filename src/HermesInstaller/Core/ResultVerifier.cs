@@ -253,8 +253,8 @@ namespace HermesInstaller.Core
             }
             Record(report, a2);
 
-            // A3 桌面端产物：mtime 与本次操作开始时间比较（对 InstallerEngine.cs:312 旧判据的直接修复）。
-            AssertionItem a3 = AssertDesktopArtifactAsync(includeDesktop, operationStartedAt);
+            // A3 桌面端产物：判据 = 产物是否已覆盖当前代码（E11），git 时间不可用时退回本轮 mtime。
+            AssertionItem a3 = await AssertDesktopArtifactAsync(includeDesktop, operationStartedAt, ct).ConfigureAwait(false);
             Record(report, a3);
 
             // A4 服务状态：baseline/restore 为 null → Skipped。
@@ -560,7 +560,13 @@ namespace HermesInstaller.Core
         // ------------------------------------------------------------- A3
 
         /// <summary>DD 冻结名（原声明为 Task 返回；无 await，落地为同步签名）。</summary>
-        private AssertionItem AssertDesktopArtifactAsync(bool includeDesktop, DateTime startedAt)
+        /// <summary>
+        /// E11（2026-10-25 13:01 桌面端升级误报修复）：A3 判据从「本轮操作是否碰过产物」改为
+        /// 「产物是否已覆盖当前代码」（HEAD 提交时间），二者等价只在有代码变化时成立。
+        /// 版本未变、G3 跳过重建的场景下旧判据必然误报「疑似旧产物」。
+        /// git 时间取不到时退回旧判据（本轮 mtime）。
+        /// </summary>
+        private async Task<AssertionItem> AssertDesktopArtifactAsync(bool includeDesktop, DateTime startedAt, CancellationToken ct)
         {
             var item = new AssertionItem { Name = "桌面端产物" };
 
@@ -571,7 +577,7 @@ namespace HermesInstaller.Core
                 return item;
             }
 
-            item.Expected = "Hermes.exe 存在且 LastWriteTime 晚于本次操作开始时间";
+            item.Expected = "Hermes.exe 存在且 LastWriteTime 晚于当前代码同步时刻（HEAD 提交时间）";
 
             bool exists = HermesPaths.DesktopBuilt;
             DateTime mtime = DateTime.MinValue;
@@ -599,9 +605,37 @@ namespace HermesInstaller.Core
                 return item;
             }
 
-            item.Actual = string.Format("产物 {0:yyyy-MM-dd HH:mm:ss} / 操作开始 {1:yyyy-MM-dd HH:mm:ss}",
-                mtime, startedAt);
+            DateTime? codeSyncTime = null;
+            try
+            {
+                codeSyncTime = await _engine.GetHeadCommitTimeAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[E11] 取代码同步时刻失败，退用本轮 mtime 判据: " + ex.Message);
+            }
 
+            if (codeSyncTime.HasValue)
+            {
+                item.Actual = string.Format("产物 {0:yyyy-MM-dd HH:mm:ss} / 代码 {1:yyyy-MM-dd HH:mm:ss}",
+                    mtime, codeSyncTime.Value);
+                if (mtime >= codeSyncTime.Value.AddMinutes(-2))
+                {
+                    item.Status = AssertionStatus.Pass;
+                    item.Detail = null;
+                    return item;
+                }
+                item.Status = AssertionStatus.Fail;
+                item.Detail = "产物早于当前代码（需重建桌面端）。如需重建请执行桌面端「修复」";
+                return item;
+            }
+
+            item.Actual = string.Format("产物 {0:yyyy-MM-dd HH:mm:ss} / 操作开始 {1:yyyy-MM-dd HH:mm:ss}（git 时间不可用）",
+                mtime, startedAt);
             if (mtime <= startedAt)
             {
                 item.Status = AssertionStatus.Fail;
