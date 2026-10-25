@@ -577,12 +577,17 @@ namespace HermesInstaller.Core
                 // 180s 无进展预算会误杀 hermes update 处于"合法静默"的阶段——
                 // ① fork 同步的静默推送（08:44 被 180s 击杀）；② source_completion
                 // 的 desktop 打包（10:00 补跑里静默运行 20+ 分钟才失败/成功）。
-                // update 阶段改用放宽的专用预算：无进展 15 分钟 / 总计 45 分钟。
+                // update 阶段改用放宽的专用预算：无进展 30 分钟 / 总计 60 分钟。
+                // E15（2026-10-25 第三次实测偏差）：17:38 那轮 update 在
+                // "Desktop app is up to date" 之后进入不往 stdout 打输出的收尾
+                // 阶段（pip/uv 依赖同步形态），静默 15 分钟被本预算击杀
+                // （17:45:11 最后输出 → 18:00:11 无进展判死 → exit 1，
+                // gitHead 未推进故 D-16 补偿也未触发）——15 分钟对该命令太紧。
                 var updateBudget = new ProcessRunOptions
                 {
                     Class = OperationClass.OperationBudget,
-                    NoProgressTimeout = TimeSpan.FromMinutes(15),
-                    TotalTimeout = TimeSpan.FromMinutes(45),
+                    NoProgressTimeout = TimeSpan.FromMinutes(30),
+                    TotalTimeout = TimeSpan.FromMinutes(60),
                     PollIntervalMs = 1000,
                 };
 
