@@ -32,6 +32,12 @@ namespace HermesInstaller.Core
         /// 供 A5 断言可见化。跨两轮 update（正常 + D-16 补偿复跑）累计；VerifyAsync 后不再保留。</summary>
         private readonly List<string> _owedMarkers = new List<string>();
 
+        /// <summary>
+        /// E16-2：真实依赖验证用的代表性 URL——uv.lock 里的 psutil git 依赖，与 misaki
+        /// 同为 github.com 直连依赖（E16 当晚两轮事故的同一死因）。测它 = 测 uv 的完整链路。
+        /// </summary>
+        private const string GitDepsVerifyUrl = "https://github.com/giampaolo/psutil.git";
+
         /// <summary>欠账标记判据：update 输出里的 follow-up 未完成话术（hermes update_cmd follow-up 机制）。</summary>
         private static bool IsOwedMarker(string line)
         {
@@ -198,6 +204,57 @@ namespace HermesInstaller.Core
             }
         }
 
+        /// <summary>
+        /// E16-2：真实依赖端到端验证。用与 BuildEnvironment 完全一致的 GIT_CONFIG 条目
+        /// （insteadOf 改写 + 传输覆盖）对代表性 git 依赖 ls-remote——psutil 与 misaki
+        /// 同为 uv.lock 里的 github.com 直连依赖，测它等于测 uv 稍后要跑的整条链路。
+        /// 不可用或仅劣化时触发 SSH 代理自动兜底并复测一次；仍不可用只 Warn 不阻塞
+        /// （依赖失败由 hermes 欠账机制兜底），但日志给足结论与建议。
+        /// </summary>
+        private async Task VerifyGitDependencyAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var probe = new GitTransportProbe(_logger, _runner);
+                GitTransportResult result = await probe
+                    .ProbeDependencyAsync(GitDepsVerifyUrl, _network.GetGitDepsRewriteEntries(), cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!(result.Ok && !result.Degraded)
+                    && await TryAutoSshProxyFallbackAsync(result.Diagnostic, cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    result = await probe
+                        .ProbeDependencyAsync(GitDepsVerifyUrl, _network.GetGitDepsRewriteEntries(), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                if (result.Ok && !result.Degraded)
+                {
+                    _logger.Info("[GIT] 依赖实测通过（psutil 经本轮 git 通道，" + result.Diagnostic + "）");
+                }
+                else if (result.Ok)
+                {
+                    _logger.Warn("[GIT] 依赖实测仅劣化可用（psutil，" + result.Diagnostic
+                        + "）——uv 解析可能很慢，失败时由欠账机制兜底。");
+                }
+                else
+                {
+                    _logger.Warn("[GIT] 依赖实测不可用（psutil，" + result.Diagnostic
+                        + "）——本轮 update 的 psutil/misaki git 依赖很可能再次失败；"
+                        + "请在代理设置里确认跳板机已保存后重试。");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[GIT] 依赖实测异常（不阻塞主流程，按已选通道继续）: " + ex.Message);
+            }
+        }
+
         /// <summary>各组当前级的一句话摘要（日志与进度用）。</summary>
         private string FormatPlan()
         {
@@ -222,6 +279,13 @@ namespace HermesInstaller.Core
         /// 做法：按 Repo 组的端点顺序（官方 → 镜像）用 git 实测，第一个能通的即为本轮路径；
         /// L0 通则登记「通用自愈覆盖」（仅注入子进程），L1 通则把 Repo/GitDeps 降级到镜像。
         /// 一条都不通才报 Error（此时 update 必然失败，日志里给足原因）。
+        /// E16（2026-10-25 晚升级事故）补两块：
+        ///   ① 劣化感知——「成功但 &gt; 5s」的 ls-remote 不再当健康路径钉死该级（当晚
+        ///      repo-0 用 10.6s 的 ls-remote 把 GitDeps 钉在 L0，insteadOf 镜像改写因此
+        ///      不注入，uv 的 psutil/misaki 只能直连 github.com 而死）；劣化时继续试镜像，
+        ///      镜像健康就用镜像（GitDeps=L1 → insteadOf 改写生效）。
+        ///   ② 代理自动兜底——直连与镜像全部「失败或仅劣化」时，若已配置跳板机但代理
+        ///      未启用，自动起 SSH 代理跑本次操作（不动 settings），再复测一遍。
         /// </summary>
         private async Task ProbeGitTransportAsync(CancellationToken cancellationToken)
         {
@@ -229,44 +293,29 @@ namespace HermesInstaller.Core
             {
                 var probe = new GitTransportProbe(_logger, _runner);
                 List<NetworkEndpoint> endpoints = Mirrors.GroupsFor(EndpointGroup.Repo);
-                string lastError = null;
 
-                for (int i = 0; i < endpoints.Count; i++)
+                ProbeOutcome outcome = await ProbeRepoLadderAsync(probe, endpoints, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!outcome.HasHealthy
+                    && await TryAutoSshProxyFallbackAsync(outcome.SummaryReason, cancellationToken)
+                        .ConfigureAwait(false))
                 {
-                    NetworkEndpoint endpoint = endpoints[i];
-                    GitTransportResult result = await probe.ProbeAsync(endpoint.Url, cancellationToken)
+                    outcome = await ProbeRepoLadderAsync(probe, endpoints, cancellationToken)
                         .ConfigureAwait(false);
-                    if (!result.Ok)
-                    {
-                        lastError = result.Diagnostic;
-                        continue;
-                    }
+                }
 
-                    _network.ApplyGitTransportOverrides(result.Overrides);
-
-                    // git 实测是 git 通道的唯一权威信号：它说哪级能通，就用哪级——
-                    // 既能降级（官方不通→镜像），也能回级（HTTP 探针嫌官方"慢"、但 git 实际可用）。
-                    _planner.ForceLevel(EndpointGroup.Repo, endpoint.Level,
-                        "git 实测: " + endpoint.Id + " 可用");
-                    _planner.ForceLevel(EndpointGroup.GitDeps, endpoint.Level,
-                        "git 实测: " + endpoint.Id + " 可用");
-
-                    if (endpoint.Level > 0)
-                    {
-                        _logger.Warn(string.Format(
-                            "[NET] git 实测：{0} 不通（{1}），改用 {2}（{3}）",
-                            endpoints[0].Id, lastError ?? "未知", endpoint.Id, endpoint.Url));
-                    }
-                    else
-                    {
-                        _logger.Info(string.Format("[NET] git 实测：{0} 可用（{1}，{2}ms）",
-                            endpoint.Id, result.Mode, result.LatencyMs));
-                    }
+                if (outcome.Chosen != null)
+                {
+                    ApplyRepoChoice(outcome.Chosen, outcome.Result);
+                    // E16-2：选定通道后，用真实依赖做一次端到端验证（含 insteadOf 改写与
+                    // 代理环境）；不健康时这里会触发 SSH 代理自动兜底并复测。
+                    await VerifyGitDependencyAsync(cancellationToken).ConfigureAwait(false);
                     return;
                 }
 
-                _logger.Error("[NET] git 实测：所有仓库端点都不可用（" + (lastError ?? "未知")
-                    + "）。本轮 update 很可能失败，请检查 git 代理/证书配置。");
+                _logger.Error("[NET] git 实测：所有仓库端点都不可用（" + (outcome.SummaryReason ?? "未知")
+                    + "）。本轮 update 很可能失败，请检查 git 代理/证书配置，或在代理设置里配置 SSH 跳板机。");
             }
             catch (OperationCanceledException)
             {
@@ -276,6 +325,132 @@ namespace HermesInstaller.Core
             {
                 _logger.Warn("[NET] git 传输探测异常（不影响主流程，按 probe 结论继续）: " + ex.Message);
             }
+        }
+
+        /// <summary>一轮端点阶梯的结论：选中端点（可为 null）、其探测结果、是否存在健康端点、原因摘要。</summary>
+        private sealed class ProbeOutcome
+        {
+            public NetworkEndpoint Chosen;
+            public GitTransportResult Result;
+            public bool HasHealthy;
+            public string SummaryReason;
+        }
+
+        /// <summary>
+        /// E16：按级走一遍 Repo 组端点。第一个「健康可用」（成功且不劣化）的端点即停；
+        /// 只有「成功但劣化」时先记为保底继续往下找更快的；全失败/全劣化时返回保底（或 null）。
+        /// </summary>
+        private async Task<ProbeOutcome> ProbeRepoLadderAsync(
+            GitTransportProbe probe, List<NetworkEndpoint> endpoints, CancellationToken cancellationToken)
+        {
+            var outcome = new ProbeOutcome();
+            string lastError = null;
+
+            for (int i = 0; i < endpoints.Count; i++)
+            {
+                NetworkEndpoint endpoint = endpoints[i];
+                GitTransportResult result = await probe.ProbeAsync(endpoint.Url, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!result.Ok)
+                {
+                    lastError = result.Diagnostic;
+                    continue;
+                }
+                if (!result.Degraded)
+                {
+                    outcome.Chosen = endpoint;
+                    outcome.Result = result;
+                    outcome.HasHealthy = true;
+                    return outcome;
+                }
+                if (outcome.Chosen == null)
+                {
+                    // 劣化保底：先记住，后面可能有健康镜像。
+                    outcome.Chosen = endpoint;
+                    outcome.Result = result;
+                    outcome.SummaryReason = result.Diagnostic;
+                }
+            }
+
+            if (outcome.Chosen == null)
+            {
+                outcome.SummaryReason = lastError;
+            }
+            return outcome;
+        }
+
+        /// <summary>把「git 实测选中」的端点落成 Repo/GitDeps 两组的强制级，并写日志。</summary>
+        private void ApplyRepoChoice(NetworkEndpoint endpoint, GitTransportResult result)
+        {
+            _network.ApplyGitTransportOverrides(result.Overrides);
+            // E16-2：把实测可用的镜像前缀交给 GitDeps 改写——GitDeps 组与 Repo 组的
+            // 镜像集合不同（只有 ghproxy.net），按级映射会错位到另一个可能已死的镜像。
+            _network.ApplyProvenGitDepsMirror(endpoint.Level > 0 ? endpoint.Url : null);
+
+            string reason = "git 实测: " + endpoint.Id + (result.Degraded ? " 劣化可用" : " 可用");
+            // git 实测是 git 通道的唯一权威信号：它说哪级能通，就用哪级——
+            // 既能降级（官方不通→镜像），也能回级（HTTP 探针嫌官方"慢"、但 git 实际可用）。
+            _planner.ForceLevel(EndpointGroup.Repo, endpoint.Level, reason);
+            _planner.ForceLevel(EndpointGroup.GitDeps, endpoint.Level, reason);
+
+            if (result.Degraded)
+            {
+                _logger.Warn(string.Format(
+                    "[NET] git 实测：{0} 仅劣化可用（{1}，{2}ms），该级已无更优端点{3}",
+                    endpoint.Id, result.Mode, result.LatencyMs,
+                    ProxyRuntime.IsActive ? "，子进程将走 SSH 代理" : ""));
+            }
+            else
+            {
+                _logger.Info(string.Format("[NET] git 实测：{0} 可用（{1}，{2}ms）",
+                    endpoint.Id, result.Mode, result.LatencyMs));
+            }
+        }
+
+        /// <summary>
+        /// E16：SSH 代理自动兜底。仅当「已配置跳板机、代理未启用、当前也未在跑」时触发，
+        /// 用克隆配置（enabled=true）起一次代理，只作用于本次操作；settings 不改写。
+        /// 返回 true 表示代理是刚刚成功启动的（调用方值得复测一轮）；已在线/起不来返回 false。
+        /// </summary>
+        private async Task<bool> TryAutoSshProxyFallbackAsync(string reason, CancellationToken cancellationToken)
+        {
+            if (ProxyRuntime.IsActive)
+            {
+                // 显式启用的代理已在跑（第一遍阶梯已经走代理了），复测没有增量。
+                return false;
+            }
+            if (_settings.SshProxyEnabled)
+            {
+                // 显式启用但启动失败过（EnsureSshProxyAsync 已 Warn），同一轮不再重试。
+                return false;
+            }
+            if (string.IsNullOrWhiteSpace(_settings.SshHost))
+            {
+                return false;
+            }
+
+            _logger.Warn(string.Format(
+                "[PROXY] 直连与镜像均不可用或劣化（{0}）——自动启用已配置的 SSH 代理（仅本次操作，不改设置）…",
+                string.IsNullOrEmpty(reason) ? "git 实测无健康端点" : reason));
+
+            var auto = new Settings
+            {
+                SshProxyEnabled = true,
+                SshHost = _settings.SshHost,
+                SshPort = _settings.SshPort,
+                SshUser = _settings.SshUser,
+                SshSocksPort = _settings.SshSocksPort,
+                SshHttpPort = _settings.SshHttpPort
+            };
+            auto.SetSshPassword(_settings.GetSshPassword());
+
+            bool ok = await ProxyRuntime.EnsureStartedAsync(auto, _logger, cancellationToken)
+                .ConfigureAwait(false);
+            if (!ok)
+            {
+                _logger.Warn("[PROXY] SSH 代理自动启动失败（" + ProxyRuntime.LastError + "），按无代理继续。");
+            }
+            return ok;
         }
 
         // ---------------------------------------------------------------- install

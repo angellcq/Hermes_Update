@@ -11,8 +11,16 @@ namespace HermesInstaller.Core
     /// </summary>
     public sealed class GitTransportResult
     {
+        /// <summary>E16：判「劣化」的阈值——ls-remote 成功但耗时超过它，说明链路能通
+        /// 却慢得反常（GFW 式干扰的典型形状：小包通、大流量死），调用方应继续尝试
+        /// 更快的端点或代理兜底，而不是把这一级当健康路径钉死。</summary>
+        internal const long DegradedMs = 5000;
+
         /// <summary>该仓库地址是否真的能被 git 访问到（ls-remote 成功）。</summary>
         public bool Ok { get; set; }
+
+        /// <summary>E16：可用但劣化（成功且耗时 &gt; DegradedMs）。Ok=true 时才有意义。</summary>
+        public bool Degraded { get; set; }
 
         /// <summary>
         /// 生效的传输方式：as-configured（本机配置原样可用）/ direct（清掉该主机的代理）/
@@ -95,15 +103,30 @@ namespace HermesInstaller.Core
                     result.Mode = attempt.Name;
                     result.Overrides = attempt.Overrides;
                     result.LatencyMs = total.ElapsedMilliseconds;
+                    // E16：成功也分「健康」与「劣化」——单次 ls-remote 超过 5 秒时，
+                    // 这次成功很可能只是干扰的间隙，不能当健康路径用。
+                    result.Degraded = stopwatch.ElapsedMilliseconds > GitTransportResult.DegradedMs;
                     result.Diagnostic = i == 0
-                        ? "as-configured 可用"
+                        ? (result.Degraded
+                            ? string.Format("as-configured 可用但劣化（{0}ms > {1}ms 阈值）",
+                                stopwatch.ElapsedMilliseconds, GitTransportResult.DegradedMs)
+                            : "as-configured 可用")
                         : string.Format("第 {0} 级修复生效（{1}），原配置：{2}", i + 1, attempt.Name, lastError);
                     if (_logger != null)
                     {
                         if (i == 0)
                         {
-                            _logger.Info(string.Format("[GIT] 传输探测通过（as-configured，{0}ms）: {1}",
-                                stopwatch.ElapsedMilliseconds, repoUrl));
+                            if (result.Degraded)
+                            {
+                                _logger.Warn(string.Format(
+                                    "[GIT] 传输探测通过但劣化（{0}ms > {1}ms 阈值）: {2}",
+                                    stopwatch.ElapsedMilliseconds, GitTransportResult.DegradedMs, repoUrl));
+                            }
+                            else
+                            {
+                                _logger.Info(string.Format("[GIT] 传输探测通过（as-configured，{0}ms）: {1}",
+                                    stopwatch.ElapsedMilliseconds, repoUrl));
+                            }
                         }
                         else
                         {
@@ -132,6 +155,62 @@ namespace HermesInstaller.Core
             result.Ok = false;
             result.LatencyMs = total.ElapsedMilliseconds;
             result.Diagnostic = lastError;
+            return result;
+        }
+
+        /// <summary>E16-2：真实 git 依赖验证——用与 BuildEnvironment 一致的 GIT_CONFIG
+        /// 条目对代表性依赖跑一次 ls-remote，测的就是 uv 稍后会跑的完整链路。</summary>
+        public async Task<GitTransportResult> ProbeDependencyAsync(
+            string repoUrl, IList<KeyValuePair<string, string>> gitEntries, CancellationToken cancellationToken)
+        {
+            var result = new GitTransportResult();
+            if (string.IsNullOrWhiteSpace(repoUrl))
+            {
+                result.Diagnostic = "依赖地址为空";
+                return result;
+            }
+
+            var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            GitConfig.Apply(env, gitEntries);
+
+            var stopwatch = Stopwatch.StartNew();
+            ProcessResult run = await RunLsRemoteCoreAsync(repoUrl, env, 25, cancellationToken)
+                .ConfigureAwait(false);
+            stopwatch.Stop();
+
+            if (run != null && run.ExitCode == 0)
+            {
+                result.Ok = true;
+                result.LatencyMs = stopwatch.ElapsedMilliseconds;
+                result.Degraded = stopwatch.ElapsedMilliseconds > GitTransportResult.DegradedMs;
+                result.Diagnostic = result.Degraded
+                    ? string.Format("可用但劣化（{0}ms > {1}ms 阈值）", stopwatch.ElapsedMilliseconds, GitTransportResult.DegradedMs)
+                    : string.Format("可用（{0}ms）", stopwatch.ElapsedMilliseconds);
+                if (_logger != null)
+                {
+                    if (result.Degraded)
+                    {
+                        _logger.Warn(string.Format(
+                            "[GIT] 依赖实测通过但劣化（{0}ms）: {1}", stopwatch.ElapsedMilliseconds, repoUrl));
+                    }
+                    else
+                    {
+                        _logger.Info(string.Format(
+                            "[GIT] 依赖实测通过（{0}ms）: {1}", stopwatch.ElapsedMilliseconds, repoUrl));
+                    }
+                }
+            }
+            else
+            {
+                result.Ok = false;
+                result.LatencyMs = stopwatch.ElapsedMilliseconds;
+                result.Diagnostic = FirstLine(run != null ? run.StandardError : null, run != null ? run.ExitCode : -1);
+                if (_logger != null)
+                {
+                    _logger.Warn(string.Format(
+                        "[GIT] 依赖实测失败: {0} —— {1}", repoUrl, result.Diagnostic));
+                }
+            }
             return result;
         }
 
@@ -205,6 +284,18 @@ namespace HermesInstaller.Core
         {
             var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             GitConfig.Apply(env, ToEntries(overrides));
+            return await RunLsRemoteCoreAsync(repoUrl, env, timeoutSeconds, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// E16-2：单次 ls-remote 核心。SSH 代理已激活时经 ProxyRuntime 把代理变量
+        /// 并进 env（未激活时空操作）——「自动兜底起代理后复测」测的才是代理链路。
+        /// </summary>
+        private async Task<ProcessResult> RunLsRemoteCoreAsync(
+            string repoUrl, IDictionary<string, string> env, int timeoutSeconds, CancellationToken cancellationToken)
+        {
+            ProxyRuntime.ApplyToEnvironment(env);
             var options = new ProcessRunOptions
             {
                 Class = OperationClass.EndpointProbe,

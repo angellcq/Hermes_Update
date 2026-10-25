@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E14（SSH 代理）交付后 30 个 C# 文件 / 12,672 行（`splitlines` 口径，排除 bin/obj）/ 1,163 节点 / 3,177 边 / DB 4.00MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E16-2（git 传输劣化感知 + SSH 代理自动兜底 + GitDeps 实测前缀改写）交付后 30 个 C# 文件 / 13,011 行（`splitlines` 口径，排除 bin/obj）/ 1,184 节点 / 3,259 边 / DB 3.88MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -76,6 +76,29 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 | `Ui/ProxyForm.cs` + `Ui/ProxyForm.Designer.cs` | 147 + 265 | 16 + 23 | 独立对话框（不往 MainForm 继续堆控件）：启用开关、主机/SSH 端口/用户名/密码/SOCKS 端口、测试连接（真起隧道取出口 IP 后立即收摊）、保存（写回 Settings，密码走 DPAPI）。Designer 由后续 WinForms 设计器化重构拆出，`ProxyForm.resx` 非本功能引入 |
 
 **既有文件相关变化（E14 后）**：`Settings.cs` 92→167 行（6 个 `[DataMember]`：`sshProxyEnabled`（默认 false）、`sshHost`、`sshPort`（22）、`sshUser`（root）、`sshSocksPort`（1080）、`sshHttpPort`（1081）、`sshPasswordProtected`；密码用 `ProtectedData.Protect(…, CurrentUser)` 存 Base64，`GetSshPassword()` 解不开返回空串不抛异常）；`HermesPaths.cs` 106→114 行（`SshDir`/`SshKeyPath`/`SshAskPassPath`/`SshPasswordFile`/`SshTunnelLog`，`EnsureAppData` 建 `ssh` 目录）；`NetworkPreparer.cs` 257→285 行（`BuildEnvironment` 末尾调 `ProxyRuntime.ApplyToEnvironment`，未启用时零副作用）；`InstallerEngine.cs` 1,199→1,235 行（新增 `EnsureSshProxyAsync`，在 `RefreshNetworkPlanAsync` **之前**调用——探针本身就该走代理，否则「探针全灭」的结论会把可用出口浪费掉；`RunInstallAsync`/`RunUpgradeAsync` 的 `finally` 各加 `ProxyRuntime.Stop()`）；`Program.cs` 201→309 行（`--ssh-proxy-test` 无 GUI 自检：打印配置/密钥/隧道/出口 IP，支持 `HERMES_SSH_PASSWORD` 临时注入密码、`HERMES_SSH_PROXY_HOLD_SECONDS` 保持隧道供并行验证 curl/git/npm）；`MainForm.cs` 1,345→**892** 行 + `MainForm.Designer.cs` **1,285** 行（代理入口 `btnProxy` + `EditProxySettings()` 已随 Wave-1 设计器化重构迁出构建代码；MainForm.cs 本身回到预算内，但「窗体总量」仍是 2,177 行，新 UI 继续放独立窗体）；`HermesInstaller.csproj` 增加 `<Reference Include="System.Security" />`（DPAPI）。
+
+**E16（2026-10-25 晚升级事故）git 传输劣化感知 + SSH 代理自动兜底**：当晚升级两轮全倒在同一堵墙——`uv.lock` 里 2 个 `git+https` 直连依赖（psutil/misaki）必须现场 clone github.com，而 GitHub 直连分钟级波动（19:20 探针全绿 → 19:21 upstream fetch <1000B/s → 19:52 起 21s 连接超时）；E13 的 git 实测用一次「成功但 10.6s」的 ls-remote 把 GitDeps **钉死在 L0**，`ApplyGitDepsRewrite` 的 insteadOf 镜像改写因 `level>=1` 不成立而不注入（改写机制本身 E16 前就有，见 `NetworkPreparer.ApplyGitDepsRewrite`）。四件套：
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | **劣化感知**：`GitTransportResult` 新增 `Degraded`（成功且 ls-remote 耗时 > `DegradedMs`=5000 判劣化，Warn 日志「通过但劣化」）。原因：GFW 式干扰的形状是「小包通、大流量死」，HTTP 探针的 2s 阈值对「一次性小请求」永远探不出大流量传输已死 | `GitTransportProbe.cs` |
+| ② | **阶梯不因劣化收窄**：`ProbeGitTransportAsync` 拆出 `ProbeRepoLadderAsync`（第一个「健康可用」端点即停；只有「成功但劣化」时记为保底继续找更快的镜像；全失败/全劣化返回保底或 null）+ `ApplyRepoChoice`（ForceLevel Repo/GitDeps + 劣化/健康分档日志）。E16 前首个成功端点直接钉级，10.6s 的劣化信号被无视 | `InstallerEngine.cs` |
+| ③ | **SSH 代理自动兜底**：直连与镜像全部「失败或仅劣化」时，若已配置跳板机（`SshHost` 非空）且代理未显式启用 → `TryAutoSshProxyFallbackAsync` 用克隆 Settings（enabled=true）起一次代理（**只作用于本次操作，不改 settings**；显式启用失败过的不重试），复测一轮阶梯。起代理后 `RunLsRemoteAsync` 经 `ProxyRuntime.ApplyToEnvironment` 走桥复测——子进程（git/uv）靠 `BuildEnvironment` 的 env 合并继承代理变量 | `InstallerEngine.cs`、`GitTransportProbe.cs` |
+| ④ | **跳板机预置默认值**：`Settings.DefaultSshHost/DefaultSshPort/DefaultSshUser` 常量（**密码绝不预置**——DPAPI 按机加密，写源码无效且泄密）；`Load()` 后 `NormalizeSshDefaults` 把存量 settings.json 里的 `null`/0 归一到默认值（DataContract 反序列化时 JSON null 会覆盖构造默认值，不归一预置就对老配置无效）。在「代理设置」里保存过的值仍优先 | `Settings.cs` 167→**206** 行 |
+
+**E16-3（2026-10-25 23:40 部署）跳板机预置落地**：`Settings.DefaultSshHost` 填入用户私人跳板机 `154.219.111.142`，且 `NormalizeSshDefaults` 把 `SshHost` 的归一范围从「仅 null」扩到「null + 空串」（E15/E16 早期版本把「代理设置」里空文本框存成 `""`，只认 null 归一不了这批存量配置）。`--ssh-proxy-test` 实测：存量 settings.json（sshHost:""）加载后 `host=154.219.111.142` 生效，ssh 密钥已生成在 `%LOCALAPPDATA%\HermesInstaller\ssh\`，仅差首次密码装公钥。`Settings.cs` 206→**209** 行；E16-2+E16-3 新 exe 已部署 `D:\HermesUpdater\net48\`（覆盖 19:17 的 E16 头版）。
+
+既有文件相关变化（E16 后）：`InstallerEngine.cs` 1,235→**1,415** 行；`GitTransportProbe.cs` 313→**404** 行；`Settings.cs` 167→**206** 行；`NetworkPreparer.cs` 285→**314** 行。构建基线不变判据：`dotnet build` 0 警告 0 错误。GitDeps 组探测不另设「真实依赖 URL」探针——psutil/misaki 与 repo-0 同为 github.com 主机，同主机重复探测无增量信号，劣化感知 + 代理兜底覆盖同一故障域。
+
+**E16-2（2026-10-25 21:18 复跑事故）GitDeps 镜像错位修复**：E16 头版遗留真窟窿被 21:18 那轮（仍是 E15 旧 exe）实锤——阶梯实测可用的是 repo-2（gh-proxy.com，4420ms 健康），但 `ForceLevel(GitDeps, 1)` 把 GitDeps 钉到**它自己组里的 L1 = ghproxy.net**（两组镜像集合不同：GitDeps 只有 gitdeps-0 github.com + gitdeps-1 ghproxy.net，没有 gh-proxy.com），insteadOf 于是把 psutil 改写到一个正在死的镜像 →「Operation too slow」两段式死亡。三件套：
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ⑤ | **实测前缀改写**：`NetworkPreparer.ApplyProvenGitDepsMirror(url)` 登记阶梯获胜端点的 Url；`GetGitDepsRewriteEntries()`（`ApplyGitDepsRewrite` 重构而来）优先用它做 insteadOf 前缀，不再按级取组内第一条——「探测过谁，uv 的 git 依赖就走谁」。L0 健康时传 null 清掉 | `NetworkPreparer.cs` |
+| ⑥ | **真实依赖端到端验证**：`GitTransportProbe.ProbeDependencyAsync(url, entries, ct)` 用与 `BuildEnvironment` 完全一致的 GIT_CONFIG 条目 ls-remote **psutil.git**（`InstallerEngine.GitDepsVerifyUrl` 常量，与 misaki 同为 uv.lock 的 github.com 直连依赖）——测的就是 uv 稍后要跑的整条链路（改写+代理+传输配置）。健康 → Info；仅劣化 → Warn；不可用 → 触发 ③ 的代理兜底并复测一次，仍不可用 Warn 给结论不阻塞（欠账机制兜底） | `GitTransportProbe.cs`、`InstallerEngine.cs` |
+| ⑦ | ls-remote 核心抽出 `RunLsRemoteCoreAsync`（代理注入收敛到这一处：`ProxyRuntime.ApplyToEnvironment(env)`），阶梯与依赖验证共用 | `GitTransportProbe.cs` |
+
+E16-2 后基线：**30 文件 / 13,011 行 / 1,184 节点 / 3,259 边 / DB 3.88MB**。部署提醒：新 exe 在 `dist/HermesInstaller/`，必须覆盖 `D:\HermesUpdater\net48\`（E16/E16-2 均未部署过就会被旧 exe 重演）。
 
 
 ```
@@ -291,8 +314,8 @@ codegraph explore "<自然语言问题>" # 一次性拉相关上下文 + 调用�
 
 索引机制备忘（照此判读，别乱「修索引」）：
 
-- 当前 `30 files / 1,163 nodes / 3,177 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`（E14 后 `codegraph sync` 复核：`Index is up to date`，与 §3 基线一致）。
-- 节点构成：method 383、property 189、field 213、import 160、class 61、constant 45、enum_member 44、file 30、namespace 30、enum 8。**`import`/`namespace`/`file` 三类共 220 个是结构性噪声**，估工作量时用 943 这个「真实声明数」。
+- 当前 `30 files / 1,177 nodes / 3,226 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`（E16 后 `codegraph sync` 复核：`Index is up to date`）。
+- 节点构成：method 387、property 190、field 217、import 160、class 62、constant 49、enum_member 44、file 30、namespace 30、enum 8。**`import`/`namespace`/`file` 三类共 220 个是结构性噪声**，估工作量时用 957 这个「真实声明数」。
 - `unresolved_refs` 恒为大量 `status='failed'`——这是 BCL/WinForms 外部符号的常态，不是索引坏了；真正的坏信号是 `project_metadata.index_state <> 'complete'`。
 - 短名符号（`Run`、`Start`、`Write`、`ToString`、属性 getter）的边可能是伪造的跨层链接：拿它当分层结论前，先 `grep` 目标命名空间是否真被 import。
 - 仓库根的 `IDEA.md` 是本地草稿（已列入 `.gitignore` 的「Local scratch」段），**不提交、不参与索引**；`git status` 应保持干净。

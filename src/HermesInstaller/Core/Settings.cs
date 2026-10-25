@@ -40,6 +40,13 @@ namespace HermesInstaller.Core
         /// <summary>内存态明文密码（无 [DataMember]，不落盘）。</summary>
         public string SshPassword { get; set; }
 
+        // E16：跳板机预置默认值（密码绝不预置——DPAPI 按机加密，写进源码既无效也泄密）。
+        // 预置后新机器装上 exe 即带跳板机配置；在「代理设置」里保存过的值仍优先（正常覆盖）。
+        // E16-3：填入用户私人跳板机（老配置/空串也归一，用户不必每次部署重填）。
+        internal const string DefaultSshHost = "154.219.111.142";   // ← 跳板机地址（IP 或域名）
+        internal const int DefaultSshPort = 22;      // ← SSH 端口
+        internal const string DefaultSshUser = "root";
+
         public Settings()
         {
             Channel = "stable";
@@ -52,9 +59,9 @@ namespace HermesInstaller.Core
             AllowHostsFix = false;
             BackupBeforeUpdate = false;
             SshProxyEnabled = false;
-            SshHost = string.Empty;
-            SshPort = 22;
-            SshUser = "root";
+            SshHost = DefaultSshHost;
+            SshPort = DefaultSshPort;
+            SshUser = DefaultSshUser;
             SshSocksPort = 1080;
             SshHttpPort = 1081;
             SshPasswordProtected = string.Empty;
@@ -132,12 +139,47 @@ namespace HermesInstaller.Core
                     {
                         loaded.Channel = "stable";
                     }
+                    NormalizeSshDefaults(loaded);
                     return loaded;
                 }
             }
             catch
             {
                 return new Settings();
+            }
+        }
+
+        /// <summary>
+        /// E16：存量 settings.json 里 SSH 字段为 null/0 时（DataContract 会用 JSON 里的
+        /// null 覆盖构造默认值）归一到预置默认值，保证「预置进项目」对老配置也生效。
+        /// E16-3：SshHost 空串也归一——E15/E16 早期版本曾把「代理设置」里空文本框保存为 ""，
+        /// 只认 null 救不了这批存量配置。
+        /// </summary>
+        private static void NormalizeSshDefaults(Settings loaded)
+        {
+            if (string.IsNullOrEmpty(loaded.SshHost))
+            {
+                loaded.SshHost = DefaultSshHost;
+            }
+            if (loaded.SshUser == null)
+            {
+                loaded.SshUser = DefaultSshUser;
+            }
+            if (loaded.SshPort <= 0)
+            {
+                loaded.SshPort = DefaultSshPort;
+            }
+            if (loaded.SshSocksPort <= 0)
+            {
+                loaded.SshSocksPort = 1080;
+            }
+            if (loaded.SshHttpPort <= 0)
+            {
+                loaded.SshHttpPort = 1081;
+            }
+            if (loaded.SshPasswordProtected == null)
+            {
+                loaded.SshPasswordProtected = string.Empty;
             }
         }
 

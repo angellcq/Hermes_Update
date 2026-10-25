@@ -24,6 +24,14 @@ namespace HermesInstaller.Core
         private Dictionary<string, string> _gitOverrides =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// E16-2：阶梯**实测可用**的 git 镜像前缀（如 https://gh-proxy.com/https://github.com/）。
+        /// 背景：GitDeps 组与 Repo 组的镜像集合不同（GitDeps 只有 ghproxy.net），按「级别」
+        /// 把 Repo 的胜利映射到 GitDeps 会错位到另一个（可能正在死的）镜像。有了实测前缀，
+        /// insteadOf 改写直接用它，保证「探测过谁，uv 的 git 依赖就走谁」。
+        /// </summary>
+        private string _provenGitDepsMirror;
+
         public NetworkPreparer(Settings settings, Logger logger)
             : this(settings, logger, null)
         {
@@ -61,6 +69,42 @@ namespace HermesInstaller.Core
                 }
                 _logger.Info("[NET] git 传输覆盖已登记（仅作用于本工具子进程）: " + string.Join("; ", parts.ToArray()));
             }
+        }
+
+        /// <summary>
+        /// E16-2：登记阶梯实测可用的 git 镜像前缀（Repo 组获胜端点的 Url）。
+        /// L0（直连健康）传 null，清掉旧登记。仅本操作生效。
+        /// </summary>
+        public void ApplyProvenGitDepsMirror(string provenUrl)
+        {
+            _provenGitDepsMirror = string.IsNullOrWhiteSpace(provenUrl) ? null : provenUrl.Trim();
+            if (_provenGitDepsMirror != null && _logger != null)
+            {
+                _logger.Info("[NET] git 依赖改写采用实测前缀（仅本操作）: " + _provenGitDepsMirror);
+            }
+        }
+
+        /// <summary>
+        /// E16-2：把 GIT_CONFIG_* 改写条目单独暴露，供「真实依赖验证探针」构造与
+        /// BuildEnvironment 完全一致的 git 配置（否则验证测的不是 uv 实际会跑的路径）。
+        /// </summary>
+        public IList<KeyValuePair<string, string>> GetGitDepsRewriteEntries()
+        {
+            var entries = new List<KeyValuePair<string, string>>();
+
+            int level = _planner.CurrentLevel(EndpointGroup.GitDeps);
+            string mirror = _provenGitDepsMirror != null ? _provenGitDepsMirror : LevelEndpointUrl(EndpointGroup.GitDeps);
+            if (level >= 1 && !string.IsNullOrWhiteSpace(mirror))
+            {
+                entries.Add(new KeyValuePair<string, string>(
+                    "url." + mirror + ".insteadOf", "https://github.com/"));
+            }
+
+            foreach (KeyValuePair<string, string> pair in _gitOverrides)
+            {
+                entries.Add(pair);
+            }
+            return entries;
         }
 
         public Dictionary<string, string> BuildEnvironment()
@@ -157,22 +201,7 @@ namespace HermesInstaller.Core
         /// </summary>
         private void ApplyGitDepsRewrite(Dictionary<string, string> env)
         {
-            var entries = new List<KeyValuePair<string, string>>();
-
-            int level = _planner.CurrentLevel(EndpointGroup.GitDeps);
-            string mirror = LevelEndpointUrl(EndpointGroup.GitDeps);
-            if (level >= 1 && !string.IsNullOrWhiteSpace(mirror))
-            {
-                entries.Add(new KeyValuePair<string, string>(
-                    "url." + mirror + ".insteadOf", "https://github.com/"));
-            }
-
-            foreach (KeyValuePair<string, string> pair in _gitOverrides)
-            {
-                entries.Add(pair);
-            }
-
-            GitConfig.Apply(env, entries);
+            GitConfig.Apply(env, GetGitDepsRewriteEntries());
         }
 
         /// <summary>
