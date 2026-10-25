@@ -132,13 +132,25 @@ namespace HermesInstaller.Core
         }
 
         /// <summary>
-        /// 单组取值：Settings 里非空且异于该组内置默认的值视为用户手填，直接生效；
-        /// 否则取 planner 当前级对应端点的 Url；组内没有该级的端点时回退内置默认。
+        /// 单组取值（E12-①，2026-10-25 14:10 事故）：
+        ///   1) planner 当前级 &gt; 0（探针/传输已判定要降级）→ 用该级端点；
+        ///   2) Settings 里非空 → 直接采纳。E12 之前这里还要求「异于内置默认」才算用户手填，
+        ///      而探针 AutoPick 选出的结果恰好就是内置默认值（npmmirror），于是被判成
+        ///      「没设置」→ 落回 planner 的 L0 = GitHub 官方直连，探针结论被自己丢掉。
+        ///   3) 空值 → planner 当前级（含 L0）端点；
+        ///   4) 组内没有该级端点 → 内置默认。
         /// </summary>
         private string Resolve(EndpointGroup group, string settingValue, string fallback)
         {
-            if (!string.IsNullOrWhiteSpace(settingValue) &&
-                !string.Equals(settingValue.Trim(), fallback, StringComparison.OrdinalIgnoreCase))
+            if (_planner.CurrentLevel(group) > 0)
+            {
+                string downgraded = LevelEndpointUrl(group);
+                if (!string.IsNullOrWhiteSpace(downgraded))
+                {
+                    return downgraded;
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(settingValue))
             {
                 return settingValue.Trim();
             }

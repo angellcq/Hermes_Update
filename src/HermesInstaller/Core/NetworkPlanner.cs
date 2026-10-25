@@ -113,6 +113,10 @@ namespace HermesInstaller.Core
         private const int FailureThreshold = 2;
         private const long RateFloorKbps = 100;
         private const long UnstableBytesThreshold = 5L * 1024 * 1024;
+
+        /// <summary>E12-②：探针判「慢」的阈值。L0 可用但延迟超过它，而更高级端点更快时，
+        /// 直接落到更高级（GitHub 慢 → 走国内镜像）。</summary>
+        private const long SlowLatencyMs = 2000;
         private const string CooldownFileName = "network-cooldown.json";
 
         /// <summary>枚举序 = 落盘与 Snapshot 的固定顺序，保证输出稳定可 diff。</summary>
@@ -153,6 +157,129 @@ namespace HermesInstaller.Core
             {
                 _expectedBytes = bytes > 0 ? bytes : 0;
             }
+        }
+
+        /// <summary>
+        /// E12-②（2026-10-25 14:10 事故）：把操作开工前探针的结果折算成各组当前级。
+        /// 规则：
+        ///   • 组内端点全部不可用 → 记一次失败，够阈值就降级（落到组内实际存在的下一级）；
+        ///   • 当前级可用且不慢（≤ SlowLatencyMs）→ 记成功，级不变；
+        ///   • 当前级不可用或慢、而更高级可用 → 直接落到该级（不做 Level±1 逐级爬）。
+        /// 这样「GitHub 慢/连不上」在升级开工前就被判成「走镜像」，而不是等传输时才发现。
+        /// 只改内存级；LoadCooldowns / SaveCooldowns 由调用方负责。
+        /// </summary>
+        public void ApplyProbeResults(IEnumerable<NetworkResult> results, long expectedBytes)
+        {
+            if (results == null)
+            {
+                return;
+            }
+            var snapshot = new List<NetworkResult>(results);
+            lock (_gate)
+            {
+                if (expectedBytes > 0)
+                {
+                    _expectedBytes = expectedBytes;
+                }
+                for (int i = 0; i < GroupOrder.Length; i++)
+                {
+                    EndpointGroup group = GroupOrder[i];
+                    NetworkResult chosen = PickProbeWinner(group, snapshot);
+                    if (chosen == null)
+                    {
+                        RecordFailure(group, "probe: 组内端点全部不可用", -1);
+                        if (ShouldDowngrade(group))
+                        {
+                            Downgrade(group, "probe: 组内端点全部不可用");
+                        }
+                        continue;
+                    }
+                    if (chosen.Endpoint.Level != _states[group].Level)
+                    {
+                        SetLevel(group, chosen.Endpoint.Level, string.Format(
+                            "probe: 选 {0}（{1}ms）", chosen.Endpoint.Id, chosen.LatencyMs));
+                    }
+                    else
+                    {
+                        RecordSuccess(group);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 组内探针优胜者：先按「级最低、同级延迟最低」取官方优先的结果；若该结果超过
+        /// SlowLatencyMs 且存在可用的更高级端点，则改取最快的高级端点（GitHub 慢 → 镜像）。
+        /// </summary>
+        private static NetworkResult PickProbeWinner(EndpointGroup group, List<NetworkResult> results)
+        {
+            List<NetworkEndpoint> endpoints = Mirrors.GroupsFor(group);
+            if (endpoints.Count == 0)
+            {
+                return null;
+            }
+            NetworkResult best = null;
+            NetworkResult fastestHigher = null;
+            for (int i = 0; i < results.Count; i++)
+            {
+                NetworkResult result = results[i];
+                if (result == null || !result.Ok || result.Endpoint == null || result.Endpoint.Id == null)
+                {
+                    continue;
+                }
+                if (!BelongsTo(endpoints, result.Endpoint.Id))
+                {
+                    continue;
+                }
+                if (best == null
+                    || result.Endpoint.Level < best.Endpoint.Level
+                    || (result.Endpoint.Level == best.Endpoint.Level && result.LatencyMs < best.LatencyMs))
+                {
+                    best = result;
+                }
+                if (result.Endpoint.Level > 0
+                    && (fastestHigher == null || result.LatencyMs < fastestHigher.LatencyMs))
+                {
+                    fastestHigher = result;
+                }
+            }
+            if (best == null)
+            {
+                return null;
+            }
+            // E12 实测修正：L0 只是「慢」（>SlowLatencyMs）时，只有更高级端点**确实更快**
+            // 才切过去。首版没比较延迟，出现 repo-0 2116ms → 切到 repo-2 4278ms 的倒挂
+            // （还顺手把 HERMES_REPO_URL 改成了 ghproxy）。
+            if (best.Endpoint.Level == 0 && best.LatencyMs > SlowLatencyMs
+                && fastestHigher != null && fastestHigher.LatencyMs < best.LatencyMs)
+            {
+                return fastestHigher;
+            }
+            return best;
+        }
+
+        private static bool BelongsTo(List<NetworkEndpoint> endpoints, string id)
+        {
+            for (int i = 0; i < endpoints.Count; i++)
+            {
+                if (string.Equals(endpoints[i].Id, id, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>直接设级（探针结论，不逐级爬），冷却 300s 并立即落盘。</summary>
+        private void SetLevel(EndpointGroup group, int level, string reason)
+        {
+            GroupState state = _states[group];
+            state.Level = level;
+            state.CooldownUntilUtc = DateTime.UtcNow.AddSeconds(CooldownSeconds);
+            state.ConsecutiveFailures = 0;
+            state.LastReason = string.IsNullOrEmpty(reason) ? "probe" : reason;
+            state.LastRateKbps = -1;
+            SaveCooldownsCore();
         }
 
         /// <summary>读取冷却状态；文件缺失 / 解析失败 / schema 超版本 → 视为无记录，绝不抛。</summary>

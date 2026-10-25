@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E11 修复后 23 个 C# 文件 / 8,548 行（Get-Content 口径，排除 bin/obj）/ 886 节点 / 2,544 边 / DB 3.09MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E12 修复后 23 个 C# 文件 / 9,157 行（`splitlines` 口径，排除 bin/obj）/ 902 节点 / 2,653 边 / DB 3.14MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -45,7 +45,7 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 
 | 文件 | 行数 | 符号 | 职责 |
 |---|---|---|---|
-| `Core/DependencyPrefetcher.cs` | 942 | 46 | E7 依赖预热：按「升级子进程将使用的 ELECTRON_MIRROR」解析缓存键 sha256(base+"v"+版本)，把 Electron 运行时 zip 预下载进 `%LOCALAPPDATA%\electron\Cache`（`@electron/get` 2.x 与本机实测键 0a74c7b0…/902aaaf9… 对齐）；版本候选 = git show upstream/main:package-lock.json（失败回退 origin）→ 本机 package-lock.json → node_modules\electron\package.json；校验源 = 本机 electron 包 checksums.json（版本一致时）→ npmmirror SHASUMS256.txt，拿不到按「未校验」落位。下载 15 分钟预算，best-effort 只 Warn 不阻塞升级。**E8 追加 fork 预同步（`PreflightForkSyncAsync`）**：把 upstream/main 预先 push 到 origin（命令与 hermes `update_cmd_git.py _sync_fork_with_upstream` 逐字一致 + 同口径 merge-base 祖先护栏），显式注入 `GIT_ASKPASS=echo`/`GCM_INTERACTIVE=never`/`GIT_HTTP_LOW_SPEED_*` 防凭证等待挂死；成功后 update 的 Syncing fork 步骤直接跳过。**E10-③ 三件套**：① 修复 `ResolveCacheRoot` 盘根 bug（HermesPaths.LocalAppDataRoot=GetPathRoot → C:\electron\Cache，预热一直写到平行宇宙从未被命中；改用 SpecialFolder.LocalApplicationData 真根）；② 双键种子 `SeedAlternateBaseKey`：主键之外再种 GitHub 官方基址键，同卷 `CreateHardLink`（P/Invoke）0 冗余、失败复制回退（11:15 实测 env 流转断掉时 install.js 走 GitHub 直连，需两种键都在真根）；③ builder 工具集预热 `WarmBuilderToolsetsAsync`：依据 npm tarball 考古（app-builder-lib 26.18.0 electronGet.js）实锤 downloadBuilderToolset 的 archive cache 公式 `<cacheRoot)\<releaseName>\<filenameWithExt>`、winCodeSign 走 legacy `.7z`（极效官方 sha256 cdaec715…）、.7z 解压需 `7zip@1.0.0/7zip-win-x64.tar.gz`（sha256 be071f15…），npmmirror 实测 200 OK；双根落位（ELECTRON_BUILDER_CACHE env 目标 + `%LOCALAPPDATA%\electron-builder\Cache` 默认根） |
+| `Core/DependencyPrefetcher.cs` | 942 | 46 | E7 依赖预热：按「升级子进程将使用的 ELECTRON_MIRROR」解析缓存键 sha256(base+"v"+版本)，把 Electron 运行时 zip 预下载进 `%LOCALAPPDATA%\electron\Cache`（`@electron/get` 2.x 与本机实测键 0a74c7b0…/902aaaf9… 对齐）；版本候选 = git show upstream/main:package-lock.json（失败回退 origin）→ 本机 package-lock.json → node_modules\electron\package.json；校验源 = 本机 electron 包 checksums.json（版本一致时）→ npmmirror SHASUMS256.txt，拿不到按「未校验」落位。下载 15 分钟预算，best-effort 只 Warn 不阻塞升级。**E8 追加 fork 预同步（`PreflightForkSyncAsync`）**：把 upstream/main 预先 push 到 origin（命令与 hermes `update_cmd_git.py _sync_fork_with_upstream` 逐字一致 + 同口径 merge-base 祖先护栏），显式注入 `GIT_ASKPASS=echo`/`GCM_INTERACTIVE=never`/`GIT_HTTP_LOW_SPEED_*` 防凭证等待挂死；成功后 update 的 Syncing fork 步骤直接跳过。**E10-③ 三件套**：① 修复 `ResolveCacheRoot` 盘根 bug（HermesPaths.LocalAppDataRoot=GetPathRoot → C:\electron\Cache，预热一直写到平行宇宙从未被命中；改用 SpecialFolder.LocalApplicationData 真根）；② 双键种子 `SeedAlternateBaseKey`：主键之外再种 GitHub 官方基址键，同卷 `CreateHardLink`（P/Invoke）0 冗余、失败复制回退（11:15 实测 env 流转断掉时 install.js 走 GitHub 直连，需两种键都在真根）；③ builder 工具集预热 `WarmBuilderToolsetsAsync`：依据 npm tarball 考古（app-builder-lib 26.18.0 electronGet.js）实锤 downloadBuilderToolset 的 archive cache 公式 `<cacheRoot)\<releaseName>\<filenameWithExt>`、winCodeSign 走 legacy `.7z`（极效官方 sha256 cdaec715…）、.7z 解压需 `7zip@1.0.0/7zip-win-x64.tar.gz`（sha256 be071f15…），npmmirror 实测 200 OK；双根落位（ELECTRON_BUILDER_CACHE env 目标 + `%LOCALAPPDATA%\electron-builder\Cache` 默认根）。**E12-③/④**：`DownloadAndPlaceAsync` 的 body 改分块读 + `CopyWithWatchdogAsync`（60s 无进展判僵死、总预算、15s 进度日志），返回实测速率供 planner 判降级；新增 `TryAdoptFromAlternateKey` 跨键复用（任一基址键已有且校验通过即硬链接，零重下） |
 
 **既有文件相关变化（E8 后）**：`NetworkPreparer.cs` 79→190 行、12→18 符号（E7 新增 `ResolveElectronBase()` 公开方法，与 `BuildEnvironment` 同路解析 `EndpointGroup.Electron`；E8-4 `BuildEnvironment` 又追加 5 个 git 防挂死变量 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `GIT_ASKPASS=echo` / `GIT_HTTP_LOW_SPEED_LIMIT=1000` / `GIT_HTTP_LOW_SPEED_TIME=30`——本机 credential.helper=manager 下 fork 推送会静默等 GUI 凭证，注入后 git 子进程禁止交互并把卡死连接 30 秒自弃）；`Mirrors.cs` 119→171 行、22→24 符号（E8-2 把 electron-0 / builder-0 两个 L0 端点补全 `releases/download/` 尾缀：`@electron/get` 与 electron-builder 对 base URL 均为零修正拼接，L0 直连缺尾缀必 404）；`InstallerEngine.cs` 580→914 行（E7 在 CLI 检查之后、停进程之前插入预热调用；E8 update 阶段改用专用放宽预算 `NoProgressTimeout=15min / TotalTimeout=45min`（D-15：原 OperationBudget 180s 无进展预算会误杀 fork 同步推送与 desktop 打包的合法静默段），退出非零但指纹 `gitHead` 已推进时补偿复跑一次 update（D-16：hermes 把未完收尾记为 owed、下次 update 自动补完，故"退出非零 ≠ 升级失败"），并新增 `ShortSha()` 小助手）。
 
@@ -54,6 +54,18 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 **既有文件相关变化（E10 后，2026-10-25 12:37 构建）**：`ResultVerifier.cs` 510→627 行（E10-② 级联探测 + `_lockedPython` 锁定；E10-① A5 `AssertOwedMarkers`，VerifyAsync 增 owedMarkers 参数）；`InstallerEngine.cs` 914→950 行（`_owedMarkers` 聚合 + `IsOwedMarker` 判据：update 输出行同时含 "Update follow-up '" 与 "did not finish"；两轮 update 均捕获后传入 VerifyAsync）；`DependencyPrefetcher.cs` 703→907 行（E10-③ 三件套见 M1 表该行）；`NetworkPreparer.cs` 190→205 行（新增 `ResolveBuilderBase()` 与第 50 行 env 注入同路；**重大结论修正**：此前"安装版 builder 代码无 ELECTRON_BUILDER_BINARIES_MIRROR 引用"系安装位 node_modules 残缺导致的伪结论，26.18.0 `electronGet.js getBinariesMirrorUrl` 确实读取该 env——镜像注入一直有效，11:20 真败因是 node-deps 阶段 electron install.js 的下载超时且缓存根错误，`C:\electron\Cache` 盘根死缓存 317MB 已清除）。工具集形状更正：winCodeSign official asset 是 `.7z`（5.6MB）不是 `.zip`（29MB，旧日实测对象）。
 
 **既有文件相关变化（E11 后，2026-10-25 13:28 构建）**：13:01 桌面端升级误报修复。`InstallerEngine.cs` 950→1045 行：重建门 `includeDesktop && !versionUnchanged && ...` 改为 `includeDesktop && desktopStale`，`desktopStale = !DesktopBuilt || mtime < HEAD 提交时间`——代码未变则产物天然「已覆盖当前代码」不重建（G3 防重复仍成立），代码更新而产物落后则必重建（用户点「桌面端升级」的真实意图）；新增 `GetHeadCommitTimeAsync`（git log -1 --format=%ct，Generic 短化 15s，带缓存）与 `IsDesktopArtifactFreshRelativeTo`（2 分钟时钟容差）。`ResultVerifier.cs` 627→657 行：A3 改异步并按同一代码时点判据，git 时间不可用时退回本轮 mtime。`DependencyPrefetcher.cs` 907→942 行：工具集预热改多源（npmmirror → env 基址 → GitHub 官方，sha256 校验与来源无关）+ 单源 3 分钟预算（13:01 实测官方源 5.6MB 走了 6.5 分钟）。
+
+**既有文件相关变化（E12 后，2026-10-25 15:20 构建）**：14:10 那轮 CLI 升级在「依赖预热」静默卡死 40 分钟（GitHub 直连 151MB 只走了 65MB，日志 593 字节后无输出，RST 后靠人工杀进程）。四件套修复：
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | `Resolve()` 取值优先级重排：**planner 级 > 0 先用该级端点 → Settings 非空值直接采纳 → 空值才问 planner → 兜底内置默认**。旧判据是「异于内置默认才算用户手填」，而探针 AutoPick 选出的最佳镜像恰好**等于**内置默认（npmmirror），于是被判定为"没设置"并回落到 planner 的 L0＝GitHub 直连——探针结论被自己丢掉，这是本次事故的直接原因 | `NetworkPreparer.cs:138` |
+| ② | **操作前网络探针**：`InstallerEngine.RefreshNetworkPlanAsync()` 在安装/升级开工前跑 `NetworkProbe`（17 端点，4 并发），结果交 `NetworkPlanner.ApplyProbeResults()` 折算各组当前级并落 `network-cooldown.json`。planner 由引擎持有（`new NetworkPreparer(_settings, logger, _planner)`），prefetch 与 `BuildEnvironment` 读同一实例。规则：组内全灭→记失败并降级；当前级可用且 ≤2s→保持；当前级不可用或 >2s **且高级端点确实更快**→直接落到该级（首版没比较延迟，实测出现 repo-0 2116ms 切到 repo-2 4278ms 的倒挂，已修）。预热下载的真实失败/速率也回灌 planner（`RecordFailure` + `ShouldDowngrade` → `Downgrade`），所以「预热发现 GitHub 慢」会让紧接着的 `hermes update` 改用镜像 | `InstallerEngine.cs:75`、`NetworkPlanner.cs:161` |
+| ③ | 下载改「分块读 + **无进展看门狗** 60s + 总预算 + 15s 进度日志」。`HttpClient.Timeout` 配 `ResponseHeadersRead` 在 .NET Framework 下只覆盖到响应头，body 读 0 字节也无限等——这是卡死 40 分钟的技术根因。现在僵死连接 60s 内被判失败并换源，日志每 15s 输出 `下载中 x/y MB（n%）平均 k KB/s` | `DependencyPrefetcher.cs:582`（`DownloadAndPlaceAsync` / `CopyWithWatchdogAsync`） |
+| ④ | **跨键复用**：目标缓存键没有该 zip 时，检查同版本在其它基址键（本次 base / npmmirror / GitHub 官方）下是否已有成品，sha256 通过就硬链接过去（失败退化为复制）。实测：npmmirror 键 `0a74c7b0…` 已有 151MB 成品 → 4 秒校验通过 → 硬链接进原本为空的 GitHub 键 `902aaaf9…`，零重下；整轮预热 47 秒（原 40 分钟未完成） | `DependencyPrefetcher.cs:184`（`TryAdoptFromAlternateKey`） |
+
+配套：删掉 `Settings.PreferDirectL0` / `Settings.EnableL1` 两个**全仓零引用**的死开关（旧 settings.json 里残留同名键由 DataContract 忽略）。当前基线：23 文件 / 9,157 行 / 902 节点 / 2,653 边；`DependencyPrefetcher` 942→1,215 行、`InstallerEngine` 1,045→1,117 行、`NetworkPlanner` 598→725 行、`NetworkPreparer` 205→217 行、`Settings` 89→92 行、`Mirrors` 171→177 行、`Models` 223→230 行、`NetworkProbe` 183→185 行（splitlines 实测）。
+
 
 ```
 HermesInstaller.sln
@@ -200,6 +212,7 @@ flowchart TD
 | `Settings.Save` | 7 | 配置落盘（`BuildRightPanel`/`BuildUi`/`RunOperationAsync`/`OfferHostsFixAsync`/`OnFormClosing` 都会触发） |
 | `EnvironmentProbe.RunAsync` | 7 | 探针入口，影响 UI 首屏 |
 | `HostsFixer.ApplyAsync` | 6 | 唯一会改系统文件的方法，波及面小但风险最高（名字别再写成 `Apply`，那是私有实现） |
+| `NetworkPlanner.ApplyProbeResults` | （E12 新增） | 探针结论折算各组当前级，**决定本轮所有镜像路径**（ELECTRON_MIRROR / HERMES_REPO_URL / npm / pip）；判错会让 `hermes update` 走错源。改判定规则后必须跑一次探针实测 |
 
 调用扇入最高的符号（`calls` 边计数）——**这些名字和签名等于全项目的公共词汇，改动成本远大于看起来的样子**：
 `MainForm.MakeButton` 19、`MainForm.AppendLog` 15、`Logger.Write` 14、`Logger.Start` 12、`MainForm.AddColumn` 12、`InstallerEngine.Report` 9。
@@ -239,10 +252,13 @@ pwsh -File .\build\build.ps1 -Configuration Debug # 换配置
 - `Settings.Load/Save` 全 catch 静默——用户报「配置没保存」时不要怀疑序列化代码，先看 `%LOCALAPPDATA%\HermesInstaller\settings.json` 权限与是否存在（保存是先写 `.tmp` 再删旧改名）。
 - 升级路径走 `hermes.cmd update --yes`，**不读 install.ps1 的阶段清单**；想改升级行为得改官方 CLI 或这里的命令行拼接，改 `RunStageAsync` 没用。
 - `HostsFixer` 里 3 条 IP 是硬编码常量，GitHub 换 IP 就失效；`IsHostsBlocked` 只认 `0.0.0.0` 形态的污染，认不出别的劫持方式。
+- **E12 起镜像不是恒定的**：`RefreshNetworkPlanAsync` 每次安装/升级都会重新探针，结论写入 `state\network-cooldown.json`（300s 冷却），并直接改变 `ELECTRON_MIRROR` / `HERMES_REPO_URL` / npm / pip。排查「为什么走了/没走镜像」先看这条文件与日志里的 `[NET] 探测结论:` 行；想强制回到官方直连，删掉该 json 即可。
+- 探针探的是**基址 URL**：`electron-0` / `builder-0` 指向 `github.com/.../releases/download/`，该路径对 GET 恒为 404 → 这两组几乎必然被判 L1（镜像），这是预期行为，别当成探测 bug；`repo-0` 探的是真实仓库地址（200），所以仓库仍会优先官方。
+- `network-cooldown.json` 的 Level 会在 300s 冷却后由 `Recover` 回收（目前只由 `CanRecover`/`Recover` 接口提供，暂无自动回级调用点）——长期卡在 L1 先看这个文件的时间戳。
 
 ## 10. 代码导航：用 codegraph，别全文搜
 
-索引在 `.codegraph/`（SQLite WAL，当前 1.5MB；自带 `.gitignore` 只保留自身，DB 不入库，但 `git status` 仍会显示 `?? .codegraph/`）。
+索引在 `.codegraph/`（SQLite WAL，当前 3.14MB；自带 `.gitignore` 只保留自身，DB 不入库，但 `git status` 仍会显示 `?? .codegraph/`）。
 
 ```bash
 codegraph status                # 索引是否最新 + 节点构成（先跑这个）
@@ -258,10 +274,9 @@ codegraph explore "<自然语言问题>" # 一次性拉相关上下文 + 调用�
 
 索引机制备忘（照此判读，别乱「修索引」）：
 
-- 当前 `14 files / 473 nodes / 1,165 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`。
-- 节点构成：method 132、property 98、import 75、field 71、class 28、enum_member 19、constant 18、file 14、namespace 14、enum 4。**`import`/`namespace`/`file` 三类共 103 个是结构性噪声**，估工作量时用 370 这个「真实声明数」。
-- 边构成：`contains` 459、`calls` 332、`references` 294、`instantiates` 79、`imports` 1。
-- `unresolved_refs` 共 1,094 条且**全部 `status='failed'`——这是 BCL/WinForms 外部符号的常态，不是索引坏了**；真正的坏信号是 `project_metadata.index_state <> 'complete'`。
+- 当前 `23 files / 902 nodes / 2,653 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`。
+- 节点构成：method 308、property 158、import 126、field 121、class 51、enum_member 44、constant 39、file 23、namespace 23、enum 8。**`import`/`namespace`/`file` 三类共 172 个是结构性噪声**，估工作量时用 729 这个「真实声明数」。
+- `unresolved_refs` 恒为大量 `status='failed'`——这是 BCL/WinForms 外部符号的常态，不是索引坏了；真正的坏信号是 `project_metadata.index_state <> 'complete'`。
 - 短名符号（`Run`、`Start`、`Write`、`ToString`、属性 getter）的边可能是伪造的跨层链接：拿它当分层结论前，先 `grep` 目标命名空间是否真被 import。
 
 <!-- BEGIN hermes-workflow-kit（由 workflow-kit-deploy 维护，勿手改本段） -->

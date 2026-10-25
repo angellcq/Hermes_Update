@@ -33,18 +33,33 @@ namespace HermesInstaller.Core
         private const string GithubElectronBase = "https://github.com/electron/electron/releases/download/";
 
         /// <summary>下载总量预算：electron zip 有 150+ MB，比 RetryPolicy.FileDownload
-        /// 的 90s 放宽到 15 分钟；无进展由取消令牌兜底。</summary>
+        /// 的 90s 放宽到 15 分钟；E12-③ 起再加「无进展看门狗」兜底（见 DownloadAndPlaceAsync）。</summary>
         private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(15);
+
+        /// <summary>E12-③（2026-10-25 14:10 事故）：单次读取无进展就判连接僵死。
+        /// 当时 GitHub 直连 40 分钟只挪了 62MB 且中途能长时间 0 字节，而 HttpClient.Timeout
+        /// 配 ResponseHeadersRead 时只覆盖到响应头，body 流不受约束 —— 必须自己看门狗。</summary>
+        private static readonly TimeSpan NoProgressTimeout = TimeSpan.FromSeconds(60);
+
+        /// <summary>E12-③：下载进度日志间隔（长时间静默是这次事故最难排查的一点）。</summary>
+        private static readonly TimeSpan ProgressLogInterval = TimeSpan.FromSeconds(15);
 
         private readonly Logger _logger;
         private readonly NetworkPreparer _network;
         private readonly ProcessRunner _runner;
+        private readonly NetworkPlanner _planner;
 
         public DependencyPrefetcher(Logger logger, NetworkPreparer network, ProcessRunner runner)
+            : this(logger, network, runner, null)
+        {
+        }
+
+        public DependencyPrefetcher(Logger logger, NetworkPreparer network, ProcessRunner runner, NetworkPlanner planner)
         {
             _logger = logger;
             _network = network;
             _runner = runner;
+            _planner = planner;
         }
 
         /// <summary>GetCacheDirectory 的目录名：sha256(base + "v" + version) 的十六进制。</summary>
@@ -173,6 +188,19 @@ namespace HermesInstaller.Core
                 }
             }
 
+            // E12-④（2026-10-25 14:10 事故）：目标键没有，但「另一个基址键」可能已有同一份
+            // 产物（本机就是 npmmirror 键里有 151MB、GitHub 键里空 → 白下 151MB）。
+            // 产物与键无关（@electron/get 只按键找文件，命中后再用包内 checksums.json 自校验），
+            // 所以先做一次跨键复用：校验通过就硬链接到目标键，零重复下载。
+            string adopted = TryAdoptFromAlternateKey(electronBase, version, fileName, expected);
+            if (adopted != null)
+            {
+                _logger.Success(string.Format("[PREFETCH] electron {0} 复用已有缓存（{1} → {2}）",
+                    version, adopted, keyDir));
+                SeedAlternateBaseKey(electronBase, version, target, cancellationToken);
+                return version + " 复用已有缓存";
+            }
+
             // 下载源优先级：升级将直连的那一个 base（保证缓存键一致）→ npmmirror → GitHub 官方。
             // 键始终按升级将用的 electronBase 落位——内容一致即可，@electron/get 只看键。
             var sources = new List<string>();
@@ -190,7 +218,8 @@ namespace HermesInstaller.Core
                 try
                 {
                     string url = EnsureTrailingSlash(sourceBase) + "v" + version + "/" + fileName;
-                    await DownloadAndPlaceAsync(url, keyDir, fileName, expected, cancellationToken).ConfigureAwait(false);
+                    long rateKbps = await DownloadAndPlaceAsync(url, keyDir, fileName, expected, cancellationToken).ConfigureAwait(false);
+                    ReportPlanner(true, string.Format("源 {0} 下载完成", DescribeSource(sourceBase)), rateKbps);
                     _logger.Success(string.Format(
                         "[PREFETCH] electron {0} 预热完成（源 {1}，缓存键 {2}）。校验: {3}",
                         version, DescribeSource(sourceBase), CacheDirectoryName(electronBase, version),
@@ -208,12 +237,101 @@ namespace HermesInstaller.Core
                 catch (Exception ex)
                 {
                     lastError = ex;
+                    ReportPlanner(false, string.Format("源 {0} 失败: {1}", DescribeSource(sourceBase), ex.Message), -1);
                     _logger.Warn(string.Format("[PREFETCH] 从 {0} 下载 electron {1} 失败: {2}", sourceBase, version, ex.Message));
                 }
             }
 
             _logger.Warn(string.Format("[PREFETCH] electron {0} 所有源都失败，放弃本轮预热（升级中途仍会重试）: {1}",
                 version, lastError != null ? lastError.Message : "未知"));
+            return null;
+        }
+
+        /// <summary>
+        /// E12-②：把预热的真实结果反馈给 planner —— 慢/失败累积到阈值后降级，
+        /// 随后的 BuildEnvironment（hermes update 用）就会切到镜像，而不是继续直连。
+        /// </summary>
+        private void ReportPlanner(bool ok, string reason, long rateKbps)
+        {
+            if (_planner == null)
+            {
+                return;
+            }
+            try
+            {
+                if (ok)
+                {
+                    _planner.RecordSuccess(EndpointGroup.Electron);
+                    return;
+                }
+                _planner.RecordFailure(EndpointGroup.Electron, reason, rateKbps);
+                if (_planner.ShouldDowngrade(EndpointGroup.Electron))
+                {
+                    _planner.Downgrade(EndpointGroup.Electron, reason);
+                    _logger.Warn("[PREFETCH] electron 组已降级（后续 hermes update 改用镜像）: " + reason);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[PREFETCH] 分级状态登记失败（不影响预热）: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// E12-④：跨键复用。目标键没文件时，检查同一版本在其它基址键（本次 base / npmmirror /
+        /// GitHub 官方）下是否已有成品；有且校验通过就硬链接到目标键（失败退化为复制）。
+        /// 返回被复用的源文件路径，无可用返回 null。
+        /// </summary>
+        private string TryAdoptFromAlternateKey(
+            string electronBase, string version, string fileName, string expected)
+        {
+            try
+            {
+                string target = Path.Combine(
+                    Path.Combine(ResolveCacheRoot(), CacheDirectoryName(electronBase, version)), fileName);
+                var bases = new List<string>();
+                AddSource(bases, electronBase);
+                AddSource(bases, Mirrors.ElectronMirror);
+                AddSource(bases, GithubElectronBase);
+
+                string root = ResolveCacheRoot();
+                foreach (string baseUrl in bases)
+                {
+                    string candidate = Path.Combine(
+                        Path.Combine(root, CacheDirectoryName(baseUrl, version)), fileName);
+                    if (string.Equals(Path.GetFullPath(candidate), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    if (!File.Exists(candidate))
+                    {
+                        continue;
+                    }
+                    if (expected != null)
+                    {
+                        string actual = Sha256File(candidate);
+                        if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _logger.Warn(string.Format(
+                                "[PREFETCH] 跨键复用候选校验不通过，忽略: {0}", candidate));
+                            continue;
+                        }
+                    }
+                    Directory.CreateDirectory(Path.GetDirectoryName(target));
+                    string link = TryCreateHardLink(target, candidate);
+                    if (link == null)
+                    {
+                        File.Copy(candidate, target, true);
+                    }
+                    _logger.Info(string.Format("[PREFETCH] 跨键复用 {0}（源 {1}，校验: {2}）",
+                        fileName, DescribeSource(baseUrl), expected != null ? "通过" : "未校验"));
+                    return candidate;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[PREFETCH] 跨键复用失败（继续按原路径下载）: " + ex.Message);
+            }
             return null;
         }
 
@@ -461,35 +579,55 @@ namespace HermesInstaller.Core
             return false;
         }
 
-        /// <summary>下载 zip → 校验 → 原子落位到 keyDir/fileName。校验不一致抛 InstallerException。</summary>
-        private async Task DownloadAndPlaceAsync(
+        /// <summary>
+        /// 下载 zip → 校验 → 原子落位到 keyDir/fileName。校验不一致抛 InstallerException。
+        /// 返回本次实际平均速率（KB/s，未知返回 -1）。
+        /// E12-③：body 流改为「分块读 + 无进展看门狗 + 总预算 + 进度日志」——
+        /// HttpClient.Timeout 在 ResponseHeadersRead 下只覆盖到响应头，body 读不到数据时会
+        /// 无限等（2026-10-25 14:10 那轮 151MB 卡了 40 分钟、日志 40 分钟没一行）。
+        /// </summary>
+        private async Task<long> DownloadAndPlaceAsync(
             string url, string keyDir, string fileName, string expected, CancellationToken cancellationToken,
             TimeSpan? timeout = null)
         {
             Directory.CreateDirectory(keyDir);
             string temp = Path.Combine(keyDir, fileName + ".prefetch-" + Guid.NewGuid().ToString("N") + ".tmp");
             bool placed = false;
+            TimeSpan budget = timeout.HasValue ? timeout.Value : DownloadTimeout;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            long received = 0;
+            long totalBytes = -1;
+            long rateKbps = -1;
 
             try
             {
-                using (var client = new HttpClient { Timeout = timeout.HasValue ? timeout.Value : DownloadTimeout })
+                using (var client = new HttpClient { Timeout = budget })
                 {
                     using (var response = await client
                         .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         response.EnsureSuccessStatusCode();
+                        if (response.Content.Headers.ContentLength.HasValue)
+                        {
+                            totalBytes = response.Content.Headers.ContentLength.Value;
+                        }
                         using (var source = await response.Content
                             .ReadAsStreamAsync().ConfigureAwait(false))
                         {
                             using (var output = File.Create(temp))
                             {
-                                await source.CopyToAsync(output, 1024 * 1024, cancellationToken).ConfigureAwait(false);
+                                received = await CopyWithWatchdogAsync(
+                                    source, output, fileName, totalBytes, budget, stopwatch, cancellationToken)
+                                    .ConfigureAwait(false);
                                 output.Flush();
                             }
                         }
                     }
                 }
+
+                stopwatch.Stop();
+                rateKbps = ComputeRateKbps(received, stopwatch.Elapsed);
 
                 if (expected != null)
                 {
@@ -517,6 +655,78 @@ namespace HermesInstaller.Core
                     catch { }
                 }
             }
+            return rateKbps;
+        }
+
+        /// <summary>
+        /// E12-③：分块拷贝 + 无进展看门狗 + 总预算 + 进度日志。返回收到的字节数。
+        /// 任一次读在 NoProgressTimeout 内没完成（连接僵死/镜像假活）或总耗时超预算，
+        /// 立刻抛异常，让上层换下一个源，而不是无限等。
+        /// </summary>
+        private async Task<long> CopyWithWatchdogAsync(
+            Stream source, Stream output, string label, long totalBytes, TimeSpan budget,
+            System.Diagnostics.Stopwatch stopwatch, CancellationToken cancellationToken)
+        {
+            var buffer = new byte[1024 * 1024];
+            long received = 0;
+            DateTime lastLogUtc = DateTime.UtcNow;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (stopwatch.Elapsed > budget)
+                {
+                    throw new TimeoutException(string.Format(
+                        "{0} 下载超预算（{1} 分钟，已收 {2}）",
+                        label, (int)budget.TotalMinutes, FormatMegabytes(received)));
+                }
+
+                Task<int> readTask = source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                Task finished = await Task.WhenAny(readTask, Task.Delay(NoProgressTimeout, cancellationToken))
+                    .ConfigureAwait(false);
+                if (finished != readTask)
+                {
+                    _logger.Warn(string.Format(
+                        "[PREFETCH] {0} 超过 {1} 秒无任何数据（已收 {2}{3}），判定连接僵死，放弃该源。",
+                        label, (int)NoProgressTimeout.TotalSeconds, FormatMegabytes(received),
+                        totalBytes > 0 ? " / " + FormatMegabytes(totalBytes) : string.Empty));
+                    throw new TimeoutException(string.Format("{0} 下载无进展超过 {1} 秒",
+                        label, (int)NoProgressTimeout.TotalSeconds));
+                }
+
+                int read = await readTask.ConfigureAwait(false);
+                if (read <= 0)
+                {
+                    break;
+                }
+                await output.WriteAsync(buffer, 0, read, cancellationToken).ConfigureAwait(false);
+                received += read;
+
+                if ((DateTime.UtcNow - lastLogUtc) >= ProgressLogInterval)
+                {
+                    lastLogUtc = DateTime.UtcNow;
+                    long kbps = ComputeRateKbps(received, stopwatch.Elapsed);
+                    _logger.Info(string.Format("[PREFETCH] {0} 下载中 {1}{2}  平均 {3} KB/s",
+                        label, FormatMegabytes(received),
+                        totalBytes > 0 ? " / " + FormatMegabytes(totalBytes)
+                            + "（" + (received * 100 / Math.Max(totalBytes, 1)) + "%）" : string.Empty,
+                        kbps));
+                }
+            }
+            return received;
+        }
+
+        private static long ComputeRateKbps(long bytes, TimeSpan elapsed)
+        {
+            if (bytes <= 0 || elapsed.TotalSeconds <= 0.5)
+            {
+                return -1;
+            }
+            return (long)(bytes / 1024.0 / elapsed.TotalSeconds);
+        }
+
+        private static string FormatMegabytes(long bytes)
+        {
+            return (bytes / 1024.0 / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " MB";
         }
 
         /// <summary>

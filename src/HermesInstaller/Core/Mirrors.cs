@@ -50,8 +50,14 @@ namespace HermesInstaller.Core
                 new NetworkEndpoint("repo-1", "源码仓库镜像 ghproxy", "源码", RepoCandidates[1], NetworkKind.GitRefs, false, 1),
                 new NetworkEndpoint("repo-2", "源码仓库镜像 gh-proxy", "源码", RepoCandidates[2], NetworkKind.GitRefs, false, 1),
 
-                new NetworkEndpoint("gitdeps-0", "GitHub 主站（git 依赖）", "官方", "https://github.com/", NetworkKind.GitRefs, false, 0),
-                new NetworkEndpoint("gitdeps-1", "ghproxy（git 依赖镜像）", "镜像", "https://ghproxy.net/https://github.com/", NetworkKind.GitRefs, false, 1),
+                new NetworkEndpoint("gitdeps-0", "GitHub 主站（git 依赖）", "官方", "https://github.com/", NetworkKind.GitRefs, false, 0)
+                {
+                    ProbeUrl = "https://github.com/NousResearch/hermes-agent"
+                },
+                new NetworkEndpoint("gitdeps-1", "ghproxy（git 依赖镜像）", "镜像", "https://ghproxy.net/https://github.com/", NetworkKind.GitRefs, false, 1)
+                {
+                    ProbeUrl = "https://ghproxy.net/https://github.com/NousResearch/hermes-agent"
+                },
 
                 new NetworkEndpoint("electron-0", "Electron 官方 releases-download", "构建", "https://github.com/electron/electron/releases/download/", NetworkKind.Http, false, 0),
                 new NetworkEndpoint("electron-1", "Electron 镜像", "构建", ElectronMirror, NetworkKind.Http, false, 1),

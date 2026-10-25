@@ -98,9 +98,11 @@ namespace HermesInstaller.Core
         private async Task<NetworkResult> ProbeOneAsync(NetworkEndpoint endpoint, CancellationToken cancellationToken)
         {
             var result = new NetworkResult { Endpoint = endpoint };
+            // E12：ProbeUrl 用于「Url 是改写前缀、不能直接 GET」的组（GitDeps）。
+            string baseUrl = string.IsNullOrWhiteSpace(endpoint.ProbeUrl) ? endpoint.Url : endpoint.ProbeUrl;
             string url = endpoint.Kind == NetworkKind.GitRefs
-                ? endpoint.Url.TrimEnd('/') + "/info/refs?service=git-upload-pack"
-                : endpoint.Url;
+                ? baseUrl.TrimEnd('/') + "/info/refs?service=git-upload-pack"
+                : baseUrl;
 
             var stopwatch = Stopwatch.StartNew();
             using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))

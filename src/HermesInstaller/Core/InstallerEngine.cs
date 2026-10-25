@@ -25,6 +25,7 @@ namespace HermesInstaller.Core
         private readonly Logger _logger;
         private readonly ProcessRunner _runner;
         private readonly NetworkPreparer _network;
+        private readonly NetworkPlanner _planner;
         private readonly ResultVerifier _verifier;
 
         /// <summary>E10-①：本轮 update 输出的 follow-up 欠账标记（"Update follow-up '…' did not finish…"），
@@ -49,7 +50,11 @@ namespace HermesInstaller.Core
             _settings = settings ?? new Settings();
             _logger = logger;
             _runner = new ProcessRunner();
-            _network = new NetworkPreparer(_settings, logger);
+            // E12-②：planner 由引擎持有，网络探针的结论与预热下载的失败样本都记在它上面，
+            // 后续 BuildEnvironment / 预热选源读同一个实例（之前 NetworkPreparer 内部自建，
+            // 探针与下载各说各话，分级状态永远是 L0）。
+            _planner = new NetworkPlanner(logger, _settings);
+            _network = new NetworkPreparer(_settings, logger, _planner);
             _verifier = new ResultVerifier(logger, this);
             _serviceGuard = new ServiceStateGuard(logger, _runner);
             _runState = new RunStateStore(logger);
@@ -109,6 +114,65 @@ namespace HermesInstaller.Core
             return await GetManifestAsync(true, cancellationToken).ConfigureAwait(false);
         }
 
+        /// <summary>
+        /// E12-②（2026-10-25 14:10 事故）：操作开工前的网络探针。
+        /// 探测 17 个端点（官方 + 镜像），把可用性与延迟折算成各组当前级，落
+        /// network-cooldown.json；随后 NetworkPreparer 与 DependencyPrefetcher 都读同一结论，
+        /// 于是「GitHub 慢/连不上」在开工前就切到镜像，而不是等 151MB 传一半才发现。
+        /// 探测本身失败不阻塞操作（沿用 Settings 里的镜像）。
+        /// </summary>
+        public async Task<string> RefreshNetworkPlanAsync(
+            IProgress<ProgressInfo> progress, CancellationToken cancellationToken)
+        {
+            try
+            {
+                Report(progress, 0, 1, "网络", "探测官方与镜像端点（决定本轮下载路径）…", true);
+                _logger.Stage("探测网络与镜像端点…");
+                try { _runState.UpdateStage("网络探测"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+
+                _planner.LoadCooldowns();
+                using (var probe = new NetworkProbe())
+                {
+                    List<NetworkResult> results = await probe.RunAsync(
+                        Mirrors.BuildEndpoints(),
+                        delegate(string message, LogLevel level) { _logger.Write(level, message); },
+                        cancellationToken).ConfigureAwait(false);
+                    _planner.ApplyProbeResults(results, 0);
+                }
+                _planner.SaveCooldowns();
+
+                string plan = FormatPlan();
+                _logger.Info("[NET] 探测结论: " + plan);
+                return plan;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[NET] 操作前网络探测失败，沿用设置中的镜像: " + ex.Message);
+                return "未探测（" + ex.Message + "）";
+            }
+        }
+
+        /// <summary>各组当前级的一句话摘要（日志与进度用）。</summary>
+        private string FormatPlan()
+        {
+            var sb = new System.Text.StringBuilder();
+            List<GroupState> states = _planner.Snapshot();
+            for (int i = 0; i < states.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(',');
+                }
+                sb.Append(states[i].Group).Append("=L").Append(states[i].Level);
+            }
+            return sb.ToString();
+        }
+
         // ---------------------------------------------------------------- install
 
         public async Task<OperationResult> RunInstallAsync(
@@ -124,6 +188,10 @@ namespace HermesInstaller.Core
                 catch (Exception ex) { _logger.Warn("[STATE] run.json 初始化失败: " + ex.Message); }
                 try { _runState.UpdateStage("获取安装脚本"); }
                 catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+
+                // E12-②：先探网络再决定走官方还是镜像（否则 install.ps1 与 Electron 都按
+                // 设置里的默认值直连，GitHub 不通时就是长时间静默等待）。
+                await RefreshNetworkPlanAsync(progress, cancellationToken).ConfigureAwait(false);
 
                 Report(progress, 0, 1, "准备", "正在获取官方安装脚本…", false);
                 await DownloadInstallerScriptAsync(cancellationToken).ConfigureAwait(false);
@@ -352,11 +420,15 @@ namespace HermesInstaller.Core
                 // E7 依赖预热：把本轮 hermes update 将用到的 Electron 运行时 zip 提前
                 // 按「升级子进程将使用的 ELECTRON_MIRROR」对应的缓存键放进 @electron/get 缓存。
                 // best-effort：任何失败只落日志，不阻塞升级（update 中途仍会按原路径重试）。
+                // E12-②：预热之前先探网络——探针结论决定 ELECTRON_MIRROR（L0 慢/不通就切镜像），
+                // 预热的键与 update 现场查询的键因此保持一致。
+                await RefreshNetworkPlanAsync(progress, cancellationToken).ConfigureAwait(false);
+
                 try { _runState.UpdateStage("依赖预热"); }
                 catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
                 Report(progress, 0, 1, "升级", "预热升级依赖（Electron 运行时缓存）…", true);
                 _logger.Stage("预热升级依赖（Electron 运行时缓存）…");
-                string prefetchNote = await new DependencyPrefetcher(_logger, _network, _runner)
+                string prefetchNote = await new DependencyPrefetcher(_logger, _network, _runner, _planner)
                     .WarmAsync(cancellationToken).ConfigureAwait(false);
                 _logger.Info("[PREFETCH] 预热摘要: " + prefetchNote);
 

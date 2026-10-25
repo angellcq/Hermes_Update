@@ -84,6 +84,13 @@ namespace HermesInstaller.Core
         [DataMember(Name = "level")]
         public int Level { get; set; }
 
+        /// <summary>
+        /// E12：探测用的真实地址。Url 对 GitDeps 组是「改写前缀」（如 https://github.com/），
+        /// 拿它拼 /info/refs 恒为 404 → 会被误判成"不可用"并降级。这里给一个真实仓库地址，
+        /// 只用于探测，不改变 Url 的改写语义。
+        /// </summary>
+        public string ProbeUrl { get; set; }
+
         public NetworkEndpoint() { }
 
         public NetworkEndpoint(string id, string name, string category, string url, NetworkKind kind, bool critical, int level = 0)
