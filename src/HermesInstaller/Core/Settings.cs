@@ -21,6 +21,11 @@ namespace HermesInstaller.Core
         [DataMember(Name = "backupBeforeUpdate")] public bool BackupBeforeUpdate { get; set; }
         [DataMember(Name = "lastOperation")] public string LastOperation { get; set; }
 
+        // M2（D-12）：分级网络策略开关；DataContract 对旧配置缺失字段用构造函数默认值，
+        // 老配置 Load() 后二者恒为 true。
+        [DataMember(Name = "preferDirectL0")] public bool PreferDirectL0 { get; set; }
+        [DataMember(Name = "enableL1")] public bool EnableL1 { get; set; }
+
         public Settings()
         {
             Channel = "stable";
@@ -32,6 +37,8 @@ namespace HermesInstaller.Core
             PipIndex = Mirrors.PipIndex;
             AllowHostsFix = false;
             BackupBeforeUpdate = false;
+            PreferDirectL0 = true;
+            EnableL1 = true;
         }
 
         public static Settings Load()

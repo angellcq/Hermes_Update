@@ -26,6 +26,21 @@ namespace HermesInstaller.Core
         private readonly ProcessRunner _runner;
         private readonly NetworkPreparer _network;
         private readonly ResultVerifier _verifier;
+
+        /// <summary>E10-①：本轮 update 输出的 follow-up 欠账标记（"Update follow-up '…' did not finish…"），
+        /// 供 A5 断言可见化。跨两轮 update（正常 + D-16 补偿复跑）累计；VerifyAsync 后不再保留。</summary>
+        private readonly List<string> _owedMarkers = new List<string>();
+
+        /// <summary>欠账标记判据：update 输出里的 follow-up 未完成话术（hermes update_cmd follow-up 机制）。</summary>
+        private static bool IsOwedMarker(string line)
+        {
+            if (string.IsNullOrEmpty(line))
+            {
+                return false;
+            }
+            return line.IndexOf("Update follow-up '", StringComparison.OrdinalIgnoreCase) >= 0
+                && line.IndexOf("did not finish", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
         private readonly ServiceStateGuard _serviceGuard;
         private readonly RunStateStore _runState;
 
@@ -334,6 +349,17 @@ namespace HermesInstaller.Core
                     throw new InstallerException("未检测到 Hermes CLI，请先执行「新装」。");
                 }
 
+                // E7 依赖预热：把本轮 hermes update 将用到的 Electron 运行时 zip 提前
+                // 按「升级子进程将使用的 ELECTRON_MIRROR」对应的缓存键放进 @electron/get 缓存。
+                // best-effort：任何失败只落日志，不阻塞升级（update 中途仍会按原路径重试）。
+                try { _runState.UpdateStage("依赖预热"); }
+                catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+                Report(progress, 0, 1, "升级", "预热升级依赖（Electron 运行时缓存）…", true);
+                _logger.Stage("预热升级依赖（Electron 运行时缓存）…");
+                string prefetchNote = await new DependencyPrefetcher(_logger, _network, _runner)
+                    .WarmAsync(cancellationToken).ConfigureAwait(false);
+                _logger.Info("[PREFETCH] 预热摘要: " + prefetchNote);
+
                 _logger.Stage("停止运行中的 Hermes 进程…");
 
                 // A2 前值预检（冻结口径，DD 偏差 D-4）：必须在停进程/动文件之前采样。
@@ -361,14 +387,37 @@ namespace HermesInstaller.Core
                 string invocation = "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " update --yes" +
                                     (_settings.BackupBeforeUpdate ? " --backup" : string.Empty);
 
-                // G8 改造点 3：升级预算走 OperationBudget（1500s 总 / 180s 无进展），不再裸跑。
+                // E10-①：本轮开始前清欠账标记，两轮 update（含 D-16 补偿复跑）共用累计。
+                _owedMarkers.Clear();
+
+                // D-15（E8，2026-10-25 两次实测偏差）：G1 冻结表 OperationBudget 的
+                // 180s 无进展预算会误杀 hermes update 处于"合法静默"的阶段——
+                // ① fork 同步的静默推送（08:44 被 180s 击杀）；② source_completion
+                // 的 desktop 打包（10:00 补跑里静默运行 20+ 分钟才失败/成功）。
+                // update 阶段改用放宽的专用预算：无进展 15 分钟 / 总计 45 分钟。
+                var updateBudget = new ProcessRunOptions
+                {
+                    Class = OperationClass.OperationBudget,
+                    NoProgressTimeout = TimeSpan.FromMinutes(15),
+                    TotalTimeout = TimeSpan.FromMinutes(45),
+                    PollIntervalMs = 1000,
+                };
+
                 ProcessResult result = await _runner.RunPowerShellAsync(
                     invocation,
                     HermesPaths.HermesHome,
                     env,
-                    (line, level) => _logger.Write(level, line),
+                    (line, level) =>
+                    {
+                        if (IsOwedMarker(line))
+                        {
+                            _owedMarkers.Add(line);
+                            _logger.Warn("[A5] 捕获 follow-up 欠账标记: " + line.Trim());
+                        }
+                        _logger.Write(level, line);
+                    },
                     cancellationToken,
-                    RetryPolicy.For(OperationClass.OperationBudget)).ConfigureAwait(false);
+                    updateBudget).ConfigureAwait(false);
 
                 if (result.Cancelled)
                 {
@@ -376,8 +425,62 @@ namespace HermesInstaller.Core
                 }
                 if (result.ExitCode != 0)
                 {
-                    throw new InstallerException("hermes update 失败（退出码 " + result.ExitCode + "）。" +
-                        Truncate(result.StandardError, 300));
+                    // D-16（E8，2026-10-25 实测语义）：hermes 的 update 有"欠账续作"
+                    // 机制——进程退出非零但代码可能已经 fast-forward（本轮 08:44 乱局：
+                    // Syncing fork 后续构建失败，HEAD 实际已到 eb1b4c5b61、网关还会被
+                    // 复原；hermes 会把未完的收尾（如 desktop build）记为 owed，等下次
+                    // update 自动补完）。所以退出非零 ≠ 升级失败：先采一次指纹，
+                    // gitHead 已推进时补偿复跑一次 update（同 env 同预算）；仍失败才报错。
+                    FingerprintRecord fpAfterFailure = await fingerprint
+                        .CaptureAsync(cancellationToken).ConfigureAwait(false);
+                    bool codeLanded = !string.Equals(fpBefore.GitHead, fpAfterFailure.GitHead,
+                        StringComparison.OrdinalIgnoreCase);
+                    if (codeLanded)
+                    {
+                        _logger.Warn(string.Format(
+                            "[E8] update 退出码 {0}，但 gitHead 已从 {1} 推进到 {2}（hermes 记有" +
+                            "欠账收尾）。补偿复跑一次 update 以完成收尾…",
+                            result.ExitCode, ShortSha(fpBefore.GitHead), ShortSha(fpAfterFailure.GitHead)));
+                        try { _runState.UpdateStage("欠账补偿复跑"); }
+                        catch (Exception ex) { _logger.Warn("[STATE] 阶段状态登记失败: " + ex.Message); }
+                        Report(progress, 0, 1, "升级", "代码已同步，补跑收尾（hermes update 重试）…", true);
+                        ProcessResult second = await _runner.RunPowerShellAsync(
+                            invocation,
+                            HermesPaths.HermesHome,
+                            env,
+                            (line, level) =>
+                            {
+                                if (IsOwedMarker(line))
+                                {
+                                    _owedMarkers.Add(line);
+                                    _logger.Warn("[A5] 捕获 follow-up 欠账标记（补偿复跑）: " + line.Trim());
+                                }
+                                _logger.Write(level, line);
+                            },
+                            cancellationToken,
+                            updateBudget).ConfigureAwait(false);
+                        if (second.Cancelled)
+                        {
+                            throw new OperationCanceledException(cancellationToken);
+                        }
+                        if (second.ExitCode == 0)
+                        {
+                            _logger.Info("[E8] 欠账补偿复跑成功，升级收尾完成。");
+                            result = second;
+                        }
+                        else
+                        {
+                            _logger.Warn("[E8] 欠账补偿复跑仍退出 " + second.ExitCode
+                                + "，按升级失败处理（hermes 记有欠账，下次升级继续补完）。");
+                            throw new InstallerException("hermes update 失败（退出码 " + second.ExitCode
+                                + "，含一次欠账补偿复跑）。" + Truncate(second.StandardError, 300));
+                        }
+                    }
+                    else
+                    {
+                        throw new InstallerException("hermes update 失败（退出码 " + result.ExitCode + "）。" +
+                            Truncate(result.StandardError, 300));
+                    }
                 }
 
                 // G3 防重复判定（同一次操作内）：无版本变化则跳过桌面端重建，杜绝 E3/E15 的
@@ -422,9 +525,11 @@ namespace HermesInstaller.Core
                     + "，PidBefore=" + restore.PidBefore + "，PidAfter=" + restore.PidAfter);
 
                 // G5 流程 ⑩（A4 联动）：真实 baseline/restore 传入，A4 不再 Skipped。
+                // E10-①：update 输出聚合的 follow-up 欠账标记传给 A5（install/repair 传 null → Skipped）。
                 VerificationReport report = await _verifier.VerifyAsync(
                     includeDesktop, serviceBaseline, restore,
-                    startedAt, cancellationToken, preCheckOk).ConfigureAwait(false);
+                    startedAt, cancellationToken, preCheckOk,
+                    new List<string>(_owedMarkers)).ConfigureAwait(false);
                 Report(progress, 1, 1, "升级", report.Summary, false);
 
                 return ConcludeResult(report, "升级", _logger.LogPath);
@@ -827,6 +932,12 @@ namespace HermesInstaller.Core
             if (string.IsNullOrEmpty(text)) return string.Empty;
             text = text.Trim();
             return text.Length <= max ? text : text.Substring(0, max) + "…";
+        }
+
+        /// <summary>指纹日志用：给祖先节留短 SHA。</summary>
+        private static string ShortSha(string sha)
+        {
+            return string.IsNullOrEmpty(sha) ? "null" : sha.Substring(0, Math.Min(10, sha.Length));
         }
 
         private sealed class StageResult

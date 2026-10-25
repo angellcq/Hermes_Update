@@ -75,23 +75,29 @@ namespace HermesInstaller.Core
             if (failed.Count > 0)
             {
                 Outcome = OperationOutcome.Failed;
-                Summary = "失败：" + string.Join("、", failed.ToArray());
+                Summary = string.Join("、", failed.ToArray());
             }
             else if (warned.Count > 0)
             {
                 Outcome = OperationOutcome.Degraded;
-                Summary = "降级完成：" + string.Join("、", warned.ToArray());
+                Summary = string.Join("、", warned.ToArray());
             }
             else if (skipped.Count > 0)
             {
+                // E9-2（2026-10-25 11:15 GUI 冒烟）：Summary 不再自嵌「降级完成：」。
+                // ConcludeResult 会用 OutcomeTitle(Degraded) 作标题再拼本串，此前两层
+                // 都写了前缀，产生「降级完成：降级完成：2 项无法断言」重复文案。
+                // 前缀语义统一收口在 OutcomeTitle（可带操作名）。
                 Outcome = OperationOutcome.Degraded;
-                Summary = "降级完成：" + skipped.Count + " 项无法断言（"
+                Summary = skipped.Count + " 项无法断言（"
                     + string.Join("、", skipped.ToArray()) + "）";
             }
             else
             {
                 Outcome = OperationOutcome.Success;
-                Summary = string.Format("升级完成，{0} 项自检全部通过", _items.Count);
+                // E9-2：不再硬编码「升级完成」——操作名由 OutcomeTitle 统一提供
+                // （安装操作原先会拼出「安装完成：升级完成，…」）。
+                Summary = string.Format("{0} 项自检全部通过", _items.Count);
             }
         }
     }
@@ -146,21 +152,47 @@ namespace HermesInstaller.Core
             _runner = new ProcessRunner(logger);
         }
 
+        /// <summary>E10-②：预检锁定的 interpreter（PreCheckDependenciesAsync 选中后供操作后 A2 复用）。</summary>
+        private string _lockedPython;
+
         /// <summary>
         /// 操作前的依赖预检（A2 的「前值」，流程 ① 之前由引擎调用）：true = import openai 成功，
         /// false/null = 不可导入或无法判定（操作后断言将按冻结口径记 Skipped，绝不冒充 Fail）。
+        /// E10-②（2026-10-25）：级联探测 + 解释器锁定。
+        /// 考古实锤：tools 全部 python（3.14.9+20261021、3.14.7+20260901）都装不上 openai
+        /// （exit 1），hermes 实际跑在 installs\&lt;id&gt;\environments\&lt;env&gt;\venv\Scripts\python.exe
+        /// （openai 2.54.0 导入成功）——旧口径只扫 tools 一个目录，永远 Skipped。
+        /// 锁定：预检选中的 interpreter 存 _lockedPython，操作后 A2 用同一个复检，避免
+        /// update 中途换装 tools python 造成"前后探测不同体"的假阳/假阴。
         /// </summary>
         public async Task<bool?> PreCheckDependenciesAsync(CancellationToken ct)
         {
             try
             {
-                string python = FindToolsPython();
-                if (string.IsNullOrEmpty(python))
+                _lockedPython = null;
+                foreach (string python in EnumeratePythonCandidates())
                 {
-                    return null;
+                    try
+                    {
+                        ProcessResult run = await RunImportCheckAsync(python, ct).ConfigureAwait(false);
+                        if (run.ExitCode == 0)
+                        {
+                            _lockedPython = python;
+                            _logger.Info("[A2-PRE] import openai 成功，锁定解释器: " + python);
+                            return true;
+                        }
+                        _logger.Info("[A2-PRE] import openai 失败（跳过下一个候选）: " + python + "（exit " + run.ExitCode + "）");
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Info("[A2-PRE] 探测候选异常（跳过）: " + python + " — " + ex.Message);
+                    }
                 }
-                ProcessResult run = await RunImportCheckAsync(python, ct).ConfigureAwait(false);
-                return run.ExitCode == 0;
+                return _lockedPython != null ? (bool?)true : (bool?)null;
             }
             catch
             {
@@ -177,7 +209,8 @@ namespace HermesInstaller.Core
             ServiceRestoreResult restore,
             DateTime operationStartedAt,
             CancellationToken ct,
-            bool? preCheckOk = null)
+            bool? preCheckOk = null,
+            System.Collections.Generic.IReadOnlyList<string> owedMarkers = null)
         {
             var report = new VerificationReport();
 
@@ -227,7 +260,46 @@ namespace HermesInstaller.Core
             // A4 服务状态：baseline/restore 为 null → Skipped。
             Record(report, AssertServiceState(baseline, restore));
 
+            // E10-①（2026-10-25 三轮升级事故沉淀）：A5 升级欠账。
+            // hermes update 有 follow-up 欠账机制：desktop build 等收尾在 update 进程内失败时
+            // 会被记为 owed，待下次 update 自动补做；但 update 本身仍是 exit 0，GUI 上毫无
+            // 感知（本轮 11:20 那 36 秒 fetch failed 完全隐形）。这就是为什么把 A2/A4 全
+            // 判 Skip、需要 A5 这个显式断言可见化。无欠账 = 通过；有欠账 = Warn（通常是
+            // "下次升级自动补做"，不会影响本轮 CLI/网关结果）；非 update 路径 = Skipped。
+            Record(report, AssertOwedMarkers(owedMarkers));
             return report;
+        }
+
+        /// <summary>A5：update 输出中的 follow-up 欠账标记断言。</summary>
+        private AssertionItem AssertOwedMarkers(System.Collections.Generic.IReadOnlyList<string> owedMarkers)
+        {
+            var item = new AssertionItem
+            {
+                Name = "升级欠账",
+                Expected = "update 输出无 follow-up 欠账标记（Update follow-up '…' did not finish）"
+            };
+
+            if (owedMarkers == null)
+            {
+                item.Status = AssertionStatus.Skipped;
+                item.Detail = "非 CLI 升级路径（安装/修复无 update 输出流），不做欠账断言";
+                return item;
+            }
+
+            if (owedMarkers.Count == 0)
+            {
+                item.Status = AssertionStatus.Pass;
+                item.Actual = "无欠账";
+                return item;
+            }
+
+            string first = owedMarkers[0].Trim();
+            item.Status = AssertionStatus.Warn;
+            item.Actual = "有欠账 ×" + owedMarkers.Count;
+            item.Detail = "hermes 记有 follow-up 欠账（首个标记: "
+                + Truncate(first, 160)
+                + "）。hermes 将在下次升级时自动补做；本轮 CLI 与网关状态不受影响，无须人工干预。";
+            return item;
         }
 
         /// <summary>入报表 + 落日志（[通过]/[警告]/[失败]/[跳过]，经 Logger→Redactor 统一出口脱敏）。</summary>
@@ -244,7 +316,7 @@ namespace HermesInstaller.Core
             var item = new AssertionItem
             {
                 Name = "CLI 版本",
-                Expected = "hermes --version 非空且匹配 ^v?\\d+\\.\\d+"
+                Expected = "hermes --version 非空且含 v?\\d+\\.\\d+ 语义版本段"
             };
 
             string version = null;
@@ -268,11 +340,15 @@ namespace HermesInstaller.Core
                 return item;
             }
 
-            if (!Regex.IsMatch(version, "^v?\\d+\\.\\d+"))
+            // 2026-10-25 10:35 事故（E9-1）：hermes 新版将 --version 首行改为
+            // "Hermes Agent v0.22.5+767.gb02fa68 (2026.9.24) · upstream … (+96 carried
+            // commits)" 冗长格式，不再以 v 开头，旧断言 ^v?\d+\.\d+ 误判升级失败
+            // （本轮实际已 Up to date + 网关冷启动成功）。改为非锚定语义版本段搜索。
+            if (!Regex.IsMatch(version, "v?\\d+\\.\\d+"))
             {
                 item.Status = AssertionStatus.Fail;
                 item.Actual = version;
-                item.Detail = "版本串不符合 v?\\d+.\\d+ 形式";
+                item.Detail = "版本串不含 v?\\d+.\\d+ 语义版本段";
                 return item;
             }
 
@@ -288,14 +364,19 @@ namespace HermesInstaller.Core
             var item = new AssertionItem
             {
                 Name = "关键依赖",
-                Expected = "python -c \"import openai\" 退出码 0"
+                Expected = "python -c \"import openai\" 退出码 0（操作前后同一解释器，级联 tools → installs venv）"
             };
 
-            string python = FindToolsPython();
+            // E10-②：优先用预检锁定的解释器（同一探测体），丢失时独立重解析兜底。
+            string python = _lockedPython;
+            if (string.IsNullOrEmpty(python))
+            {
+                python = FindToolsPython();
+            }
             if (string.IsNullOrEmpty(python))
             {
                 item.Status = AssertionStatus.Skipped;
-                item.Detail = "未找到 <HERMES_HOME>\\tools\\python-*\\python.exe，无法导入探测";
+                item.Detail = "未找到任何可探测解释器（tools\\python-*\\python.exe 与 installs\\*\\environments\\*\\venv\\Scripts\\python.exe 均无）";
                 return item;
             }
 
@@ -312,6 +393,10 @@ namespace HermesInstaller.Core
             if (dirSep > 0)
             {
                 label = Path.GetFileName(Path.GetDirectoryName(python));
+            }
+            if (label == "Scripts")
+            {
+                label = "installs venv";
             }
             item.Actual = label;
 
@@ -414,6 +499,62 @@ namespace HermesInstaller.Core
                 _logger.Warn("扫描 tools\\python-* 失败: " + ex.Message);
                 return null;
             }
+        }
+
+        /// <summary>
+        /// E10-②：python 候选级联枚举（探测顺序固定，保证操作前后同一解释器体）：
+        /// ① tools\python-*\python.exe（最高版本优先，FindToolsPython 同款推导）；
+        /// ② installs\&lt;installId&gt;\environments\&lt;envId&gt;\venv\Scripts\python.exe（完整路径排序）。
+        /// 本机实况：①们都没有 openai（exit 1），②的 venv 有 openai 2.54.0（import 成功）。
+        /// </summary>
+        private IEnumerable<string> EnumeratePythonCandidates()
+        {
+            string tools = FindToolsPython();
+            if (!string.IsNullOrEmpty(tools))
+            {
+                yield return tools;
+            }
+
+            // 注意：迭代器不能在含 catch 的 try 块体内 yield（CS1626），先收集后产出。
+            foreach (string venv in CollectVenvPythons())
+            {
+                yield return venv;
+            }
+        }
+
+        private static List<string> CollectVenvPythons()
+        {
+            var venvs = new List<string>();
+            try
+            {
+                string installsDir = Path.Combine(HermesPaths.HermesHome, "installs");
+                if (!Directory.Exists(installsDir))
+                {
+                    return venvs;
+                }
+                foreach (string installDir in Directory.GetDirectories(installsDir))
+                {
+                    string envRoot = Path.Combine(installDir, "environments");
+                    if (!Directory.Exists(envRoot))
+                    {
+                        continue;
+                    }
+                    foreach (string envDir in Directory.GetDirectories(envRoot))
+                    {
+                        string venv = Path.Combine(envDir, "venv", "Scripts", "python.exe");
+                        if (File.Exists(venv))
+                        {
+                            venvs.Add(venv);
+                        }
+                    }
+                }
+                venvs.Sort(StringComparer.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                // best-effort：候选枚举失败静默为空集（PreCheck 外层已有兜底日志和 Skipped 收敛）。
+            }
+            return venvs;
         }
 
         // ------------------------------------------------------------- A3

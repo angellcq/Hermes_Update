@@ -53,9 +53,9 @@ namespace HermesInstaller.Core
                 new NetworkEndpoint("gitdeps-0", "GitHub 主站（git 依赖）", "官方", "https://github.com/", NetworkKind.GitRefs, false, 0),
                 new NetworkEndpoint("gitdeps-1", "ghproxy（git 依赖镜像）", "镜像", "https://ghproxy.net/https://github.com/", NetworkKind.GitRefs, false, 1),
 
-                new NetworkEndpoint("electron-0", "Electron 官方 releases", "构建", "https://github.com/electron/electron/releases", NetworkKind.Http, false, 0),
+                new NetworkEndpoint("electron-0", "Electron 官方 releases-download", "构建", "https://github.com/electron/electron/releases/download/", NetworkKind.Http, false, 0),
                 new NetworkEndpoint("electron-1", "Electron 镜像", "构建", ElectronMirror, NetworkKind.Http, false, 1),
-                new NetworkEndpoint("builder-0", "electron-builder 官方 releases", "构建", "https://github.com/electron-userland/electron-builder-binaries/releases", NetworkKind.Http, false, 0),
+                new NetworkEndpoint("builder-0", "electron-builder 官方 releases-download", "构建", "https://github.com/electron-userland/electron-builder-binaries/releases/download/", NetworkKind.Http, false, 0),
                 new NetworkEndpoint("builder-1", "electron-builder 工具镜像", "构建", BuilderMirror, NetworkKind.Http, false, 1),
 
                 new NetworkEndpoint("npm-0", "npm 官方源", "构建", "https://registry.npmjs.org/", NetworkKind.Http, false, 0),

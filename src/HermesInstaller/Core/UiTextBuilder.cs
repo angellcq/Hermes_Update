@@ -17,7 +17,7 @@ namespace HermesInstaller.Core
             switch (outcome)
             {
                 case OperationOutcome.Success: return name + "完成";
-                case OperationOutcome.Degraded: return "降级完成";
+                case OperationOutcome.Degraded: return name + "降级完成";
                 default: return name + "失败";
             }
         }

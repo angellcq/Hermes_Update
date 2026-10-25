@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-10-24 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**M1 交付后 21 个 C# 文件 / 6,550 行 / 724 节点 / 2,011 边 / DB 2.39MB**（M1 前为 14 / 3,996 / 473 / 1,165 / 1.5MB）。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-10-25 `codegraph` 全量索引实测**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E10 冒烟修复后 23 个 C# 文件 / 8,388 行（Get-Content 口径，排除 bin/obj）/ 880 节点 / 2,507 边 / DB 3.02MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -25,14 +25,14 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 
 ## 3. 目录结构（括号内为 行数 / 符号数 / 被依赖文件数）
 
-行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；**M1 交付后 21 个文件合计 6,550 行 / 724 节点**。扣掉 file/namespace/import（共 151 个）后的真实声明是 **573 个**：method 217、property 141、field 107、class 46、enum_member 35、constant 20、enum 7。
+行数按 `splitlines`，符号数按 `codegraph files`（含 file/namespace/import 节点）；**E7 升级预热交付后 23 个文件合计 7,831 行 / 856 节点**。扣掉 file/namespace/import 后的真实声明：method 279、property 160、field 115、class 51、constant 28、enum 8、enum_member 44。
 
 **M1（2026-10-24）新增的 7 个 Core 文件（共 2,060 行 / 214 符号）**——下列目录树为 M1 前的结构，新文件已并入 `Core/`：
 
 | 文件 | 行数 | 符号 | 职责 |
 |---|---|---|---|
 | `Core/RetryPolicy.cs` | 169 | 25 | 九类操作超时/重试/退避参数表 + `ProcessRunOptions` |
-| `Core/ResultVerifier.cs` | 524 | 58 | A1–A4 四项断言、`VerificationReport`、三态合成；另含 `ServiceEntry`/`ServiceSnapshot`/`ServiceRestoreResult` |
+| `Core/ResultVerifier.cs` | 627 | 58 | A1–A5 五项断言、`VerificationReport`、三态合成；另含 `ServiceEntry`/`ServiceSnapshot`/`ServiceRestoreResult`。E9-1：A1 CLI 版本断言由 `^v?\d+\.\d+` 整串锚定改为非锚定语义版本段搜索。E9-2：三态 Summary 去掉自嵌的前缀「失败：/降级完成：」，前缀统一由 `UiTextBuilder.OutcomeTitle` 提供（修复「降级完成：降级完成：」重复文案；Success Summary 去硬编码「升级完成」）。E10-②：A2 改级联探测（tools → installs venv，CollectVenvPythons 定向三层枚举）+ 解释器锁定 `_lockedPython`（操作前后同一核探体）。E10-①：新增 A5 升级欠账断言（VerifyAsync 新参数 owedMarkers；无欠账=Pass、有欠账=Warn「下次升级自动补做」、非升级路径=Skipped） |
 | `Core/VersionFingerprint.cs` | 228 | 30 | gitHead + lockSha256 + cliVersion 三元组采集/判等/落盘 |
 | `Core/HomeRegistry.cs` | 272 | 27 | 三个候选数据根枚举 + 去重 + 进程按根归属 |
 | `Core/ServiceStateGuard.cs` | 343 | 21 | 网关状态快照与 `ensure → start → 降级` 复原（含双起防护） |
@@ -40,6 +40,18 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 | `Core/UiTextBuilder.cs` | 145 | 14 | 结论/断言行/多根摘要等文案生成（不引 WinForms） |
 
 **既有文件符号数变化**（M1 后）：`InstallerEngine` 42→52、`ProcessRunner` 25→38、`Models` 89→97、`HermesPaths` 26→30、`MainForm` 102→103。`MainForm.cs` 行数 1,310→**1,345**（NFR-09 预算 ≤1,355）。
+
+**E7（2026-10-25）新增的 1 个 Core 文件（升级预热）**：
+
+| 文件 | 行数 | 符号 | 职责 |
+|---|---|---|---|
+| `Core/DependencyPrefetcher.cs` | 907 | 46 | E7 依赖预热：按「升级子进程将使用的 ELECTRON_MIRROR」解析缓存键 sha256(base+"v"+版本)，把 Electron 运行时 zip 预下载进 `%LOCALAPPDATA%\electron\Cache`（`@electron/get` 2.x 与本机实测键 0a74c7b0…/902aaaf9… 对齐）；版本候选 = git show upstream/main:package-lock.json（失败回退 origin）→ 本机 package-lock.json → node_modules\electron\package.json；校验源 = 本机 electron 包 checksums.json（版本一致时）→ npmmirror SHASUMS256.txt，拿不到按「未校验」落位。下载 15 分钟预算，best-effort 只 Warn 不阻塞升级。**E8 追加 fork 预同步（`PreflightForkSyncAsync`）**：把 upstream/main 预先 push 到 origin（命令与 hermes `update_cmd_git.py _sync_fork_with_upstream` 逐字一致 + 同口径 merge-base 祖先护栏），显式注入 `GIT_ASKPASS=echo`/`GCM_INTERACTIVE=never`/`GIT_HTTP_LOW_SPEED_*` 防凭证等待挂死；成功后 update 的 Syncing fork 步骤直接跳过。**E10-③ 三件套**：① 修复 `ResolveCacheRoot` 盘根 bug（HermesPaths.LocalAppDataRoot=GetPathRoot → C:\electron\Cache，预热一直写到平行宇宙从未被命中；改用 SpecialFolder.LocalApplicationData 真根）；② 双键种子 `SeedAlternateBaseKey`：主键之外再种 GitHub 官方基址键，同卷 `CreateHardLink`（P/Invoke）0 冗余、失败复制回退（11:15 实测 env 流转断掉时 install.js 走 GitHub 直连，需两种键都在真根）；③ builder 工具集预热 `WarmBuilderToolsetsAsync`：依据 npm tarball 考古（app-builder-lib 26.18.0 electronGet.js）实锤 downloadBuilderToolset 的 archive cache 公式 `<cacheRoot)\<releaseName>\<filenameWithExt>`、winCodeSign 走 legacy `.7z`（极效官方 sha256 cdaec715…）、.7z 解压需 `7zip@1.0.0/7zip-win-x64.tar.gz`（sha256 be071f15…），npmmirror 实测 200 OK；双根落位（ELECTRON_BUILDER_CACHE env 目标 + `%LOCALAPPDATA%\electron-builder\Cache` 默认根） |
+
+**既有文件相关变化（E8 后）**：`NetworkPreparer.cs` 79→190 行、12→18 符号（E7 新增 `ResolveElectronBase()` 公开方法，与 `BuildEnvironment` 同路解析 `EndpointGroup.Electron`；E8-4 `BuildEnvironment` 又追加 5 个 git 防挂死变量 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `GIT_ASKPASS=echo` / `GIT_HTTP_LOW_SPEED_LIMIT=1000` / `GIT_HTTP_LOW_SPEED_TIME=30`——本机 credential.helper=manager 下 fork 推送会静默等 GUI 凭证，注入后 git 子进程禁止交互并把卡死连接 30 秒自弃）；`Mirrors.cs` 119→171 行、22→24 符号（E8-2 把 electron-0 / builder-0 两个 L0 端点补全 `releases/download/` 尾缀：`@electron/get` 与 electron-builder 对 base URL 均为零修正拼接，L0 直连缺尾缀必 404）；`InstallerEngine.cs` 580→914 行（E7 在 CLI 检查之后、停进程之前插入预热调用；E8 update 阶段改用专用放宽预算 `NoProgressTimeout=15min / TotalTimeout=45min`（D-15：原 OperationBudget 180s 无进展预算会误杀 fork 同步推送与 desktop 打包的合法静默段），退出非零但指纹 `gitHead` 已推进时补偿复跑一次 update（D-16：hermes 把未完收尾记为 owed、下次 update 自动补完，故"退出非零 ≠ 升级失败"），并新增 `ShortSha()` 小助手）。
+
+**既有文件相关变化（E9 后）**：`ResultVerifier.cs` 524→510 行（此前行数记录为陈旧值；E9-1 A1 版本断言锚定放宽 + E9-2 三态 Summary 前缀收口，见 M1 表该行）；`UiTextBuilder.OutcomeTitle` Degraded 分支改为 `"{操作名}降级完成"`；`DependencyPrefetcher.cs` `GitStdOutAsync` 修复"引号路径与参数粘连少空格" bug（E9-0：`-C "路径"rev-parse` 必然失败 → 曾把已存在的 upstream/main 误报为"无引用"而跳过预同步；11:15 冒烟验证修复后预同步真实执行——push 以"无凭证 Repository Not Found"3 秒快速失败并继续，符合设计）。
+
+**既有文件相关变化（E10 后，2026-10-25 12:37 构建）**：`ResultVerifier.cs` 510→627 行（E10-② 级联探测 + `_lockedPython` 锁定；E10-① A5 `AssertOwedMarkers`，VerifyAsync 增 owedMarkers 参数）；`InstallerEngine.cs` 914→950 行（`_owedMarkers` 聚合 + `IsOwedMarker` 判据：update 输出行同时含 "Update follow-up '" 与 "did not finish"；两轮 update 均捕获后传入 VerifyAsync）；`DependencyPrefetcher.cs` 703→907 行（E10-③ 三件套见 M1 表该行）；`NetworkPreparer.cs` 190→205 行（新增 `ResolveBuilderBase()` 与第 50 行 env 注入同路；**重大结论修正**：此前"安装版 builder 代码无 ELECTRON_BUILDER_BINARIES_MIRROR 引用"系安装位 node_modules 残缺导致的伪结论，26.18.0 `electronGet.js getBinariesMirrorUrl` 确实读取该 env——镜像注入一直有效，11:20 真败因是 node-deps 阶段 electron install.js 的下载超时且缓存根错误，`C:\electron\Cache` 盘根死缓存 317MB 已清除）。工具集形状更正：winCodeSign official asset 是 `.7z`（5.6MB）不是 `.zip`（29MB，旧日实测对象）。
 
 ```
 HermesInstaller.sln
@@ -172,7 +184,7 @@ flowchart TD
 - `HostsFixer`：备份到 `%LOCALAPPDATA%\HermesInstaller\hosts-backups\hosts.bak-<yyyyMMdd-HHmmss>`（`TryBackup(out path)` 失败即放弃写；`RestoreLatestBackup` 取最新一份还原）；`ApplyAsync` 删掉 hosts 里已有的 `github.com` / `raw.githubusercontent.com` 映射后**写入 3 条硬编码 IP**（`185.199.108.133`、`185.199.111.133` → raw.githubusercontent.com，`20.205.243.166` → github.com），再 `ipconfig /flushdns` + `/registerdns`。这些 IP 会过期——「修了 hosts 还是不通」先怀疑这里。`IsHostsBlocked` 以「有 `0.0.0.0` + `raw.githubusercontent.com`」判被污染。
 - 提权方式：app.manifest 是 `asInvoker`（平时不以管理员跑）+ `PerMonitorV2` DPI + `longPathAware`；`MainForm.FixHostsAsync` 检测到非管理员时，用 `Application.ExecutablePath --fix-hosts` + `Verb=runas` 自提权重启一个自身进程，再由 `Program.RunHostsAction(true)` 落地（`--restore-hosts` 走同一个方法，参数 false）。
 - `Settings` 的 12 个字段：`channel`（默认 `stable`）、`skipBrowser`、`skipComputerUse`、`autoDetectMirrors`（默认 `true`）、`repoMirror`、`electronMirror`、`builderMirror`、`npmRegistry`、`pipIndex`、`allowHostsFix`（默认 `false`）、`backupBeforeUpdate`（默认 `false`）、`lastOperation`。`Load()` 任何异常都静默返回默认值，`Save()` 任何异常都静默吞掉——**配置丢了不会报错**，排查只能看 `%LOCALAPPDATA%\HermesInstaller\settings.json` 是否存在。
-- `NetworkPreparer.BuildEnvironment()` 注入 13 个环境变量：`HERMES_REPO_URL`、`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`、`ELECTRON_BUILDER_CACHE`、`npm_config_registry`+`NPM_CONFIG_REGISTRY`、`PIP_INDEX_URL`+`PIP_TRUSTED_HOST`、`UV_DEFAULT_INDEX`+`UV_INDEX_URL`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`、`PYTHONUTF8`+`PYTHONIOENCODING`。加变量时两边大小写都要给（npm 就是这么成对的）。
+- `NetworkPreparer.BuildEnvironment()` 注入 18 个环境变量：`HERMES_REPO_URL`、`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`、`ELECTRON_BUILDER_CACHE`、`npm_config_registry`+`NPM_CONFIG_REGISTRY`、`PIP_INDEX_URL`+`PIP_TRUSTED_HOST`、`UV_DEFAULT_INDEX`+`UV_INDEX_URL`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`、`GIT_ASKPASS=echo`、`GIT_HTTP_LOW_SPEED_LIMIT=1000`、`GIT_HTTP_LOW_SPEED_TIME=30`、`PYTHONUTF8`+`PYTHONIOENCODING`。加变量时两边大小写都要给（npm 就是这么成对的）。后 5 个 git 变量是 E8 防挂死组（见 §3「既有文件相关变化」）：fork 推送无凭证时快速失败而非静默等待 GUI / 180s 预算击杀。
 
 ## 6. 改动风险（`codegraph impact` 实测，2026-10-24）
 
