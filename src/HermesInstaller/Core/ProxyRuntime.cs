@@ -182,6 +182,18 @@ namespace HermesInstaller.Core
             env["ELECTRON_GET_USE_PROXY"] = "1";
             env["GLOBAL_AGENT_HTTP_PROXY"] = http;
             env["GLOBAL_AGENT_HTTPS_PROXY"] = http;
+
+            // E17：这些代理变量只对本次操作有效。hermes update 会重启长驻 gateway，
+            // 它继承整个环境块；一键收摊（Stop）把 1081 桥停掉后，gateway 仍拿着
+            // HTTP(S)_PROXY=http://127.0.0.1:1081，之后所有出网请求都是
+            // httpcore ConnectError [Errno 10061]，Nous OAuth 登录即报「服务连不上」。
+            // 官方 Desktop 用 HERMES_UPDATE_SYSTEM_PROXY 标记同一批键，后端启动时
+            // （hermes_cli/update_proxy_env.py 的 restore_user_proxy_env）会按标记丢弃；
+            // 这里必须同样标记，否则升级一次就把登录弄坏一次。
+            // 注：ALL_PROXY 不在官方清理集（_ADDED_KEYS）内，它指向用户的 SOCKS 端口，
+            // 常开时残留无害；要一并清理必须同时扩充 Hermes 侧的白名单。
+            env["HERMES_UPDATE_SYSTEM_PROXY"] =
+                "HTTPS_PROXY,https_proxy,HTTP_PROXY,http_proxy,NO_PROXY,no_proxy";
         }
 
         /// <summary>
