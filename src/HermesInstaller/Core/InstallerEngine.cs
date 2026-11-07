@@ -385,6 +385,7 @@ namespace HermesInstaller.Core
             _network.ApplyGitTransportOverrides(result.Overrides);
             // E16-2：把实测可用的镜像前缀交给 GitDeps 改写——GitDeps 组与 Repo 组的
             // 镜像集合不同（只有 ghproxy.net），按级映射会错位到另一个可能已死的镜像。
+            // E18：这里传的是**仓库地址**，NetworkPreparer 会截成前缀后再做 insteadOf。
             _network.ApplyProvenGitDepsMirror(endpoint.Level > 0 ? endpoint.Url : null);
 
             string reason = "git 实测: " + endpoint.Id + (result.Degraded ? " 劣化可用" : " 可用");

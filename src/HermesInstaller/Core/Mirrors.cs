@@ -112,6 +112,42 @@ namespace HermesInstaller.Core
             }
         }
 
+        /// <summary>
+        /// E18：把「仓库地址」截成 git 镜像前缀（insteadOf 的替换基址）。
+        /// 例：https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.git
+        ///   → https://gh-proxy.com/https://github.com/
+        /// 做法：已是前缀（以 / 结尾）原样返回；否则去掉最后两段路径（owner/repo.git）。
+        /// E16-2 曾把整个仓库地址直接当 insteadOf 前缀用，git 于是把
+        /// https://github.com/ 替换成「镜像前缀 + 仓库路径」，产出
+        /// https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.gitNousResearch/hermes-agent.git
+        /// ——本机 GitHub 直连不通、repo-2（gh-proxy）获胜时 update 必然失败。
+        /// 无法判定时返回 null（调用方按「不注入改写」处理）。
+        /// </summary>
+        public static string RepoUrlToMirrorPrefix(string repoUrl)
+        {
+            if (string.IsNullOrWhiteSpace(repoUrl))
+            {
+                return null;
+            }
+            string url = repoUrl.Trim();
+            if (url.EndsWith("/", StringComparison.Ordinal))
+            {
+                return url;
+            }
+            int lastSlash = url.LastIndexOf('/');
+            if (lastSlash <= 0)
+            {
+                return null;
+            }
+            string withoutRepo = url.Substring(0, lastSlash);
+            int ownerSlash = withoutRepo.LastIndexOf('/');
+            if (ownerSlash <= 0)
+            {
+                return null;
+            }
+            return withoutRepo.Substring(0, ownerSlash + 1);
+        }
+
         public static string PickRepoMirror(IEnumerable<NetworkResult> results)
         {
             if (results == null)

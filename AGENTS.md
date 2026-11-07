@@ -1,7 +1,7 @@
 # Hermes Update — 项目技术地图
 
 > 面向 agent 的项目速览。用户文档见 `README.md`。
-> 本文所有数字取自 **2026-11-04 `codegraph` 全量索引复核**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E17（升级后一次性代理环境变量标记）交付后 30 个 C# 文件 / 13,026 行（`splitlines` 口径，排除 bin/obj）/ 1,184 节点 / 3,259 边 / DB 3.88MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
+> 本文所有数字取自 **2026-11-07 `codegraph` 全量索引复核**（codegraph 1.6.0 / extraction 25 / `index_state=complete`）：**E18（git 依赖 insteadOf 前缀截断修复）交付后 30 个 C# 文件 / 13,070 行（`splitlines` 口径，排除 bin/obj）/ 1,185 节点 / 3,261 边 / DB 4.06MB**。改代码后先 `codegraph sync`，再用 `codegraph status` 复核，最后回来改这里被影响的数字。
 > **口径互斥时以本节为准**：规模看 `codegraph status`（或 `select count(*) from files`），不看 `project_metadata.index_files_discovered`（`sync` 不写回该字段，会停在最后一次全量索引的值）。行数口径是 `splitlines`（`HostsFixer.cs` 结尾无换行，`wc -l` 会少算 1 行）。符号数口径是 `codegraph files` 输出的 `node_count`（含该文件的 file/namespace/import 节点）。
 
 ## 1. 项目定位
@@ -101,6 +101,8 @@ Windows 平台的 **Hermes Agent / Hermes 桌面端** 安装与升级工具（�
 E16-2 后基线：**30 文件 / 13,011 行 / 1,184 节点 / 3,259 边 / DB 3.88MB**。部署提醒：新 exe 在 `dist/HermesInstaller/`，必须覆盖 `D:\HermesUpdater\net48\`（E16/E16-2 均未部署过就会被旧 exe 重演）。
 
 **E17（2026-11-04，升级后 Nous 订阅登录失效）一次性代理环境变量标记**：事故链——09:16 `HermesInstaller` 跑 DesktopUpgrade 时检测到用户自建 `D:\tools\app\SshTunnel.exe` 的 1080 SOCKS5（`-D 127.0.0.1:1080`），复用并起 1081 HTTP 桥，把 `HTTPS_PROXY=http://127.0.0.1:1081` 等灌进 `hermes update` 子进程；`hermes update` 重启的长驻 gateway 继承整套环境；09:24 升级结束 `ProxyRuntime.Stop()` 停掉 1081 桥，gateway 仍指向死端口；09:47 用户点 Nous 订阅登录，gateway 的 httpx 走 `HTTPS_PROXY` → `httpcore.ConnectError [Errno 10061]`，桌面端报「The Nous service couldn't be reached to finish signing you in」（`desktop.log` 4 次，09:47:30–09:50:40）。修复：`ProxyRuntime.ApplyToEnvironment` 注入代理时同步写 `HERMES_UPDATE_SYSTEM_PROXY=HTTPS_PROXY,https_proxy,HTTP_PROXY,http_proxy,NO_PROXY,no_proxy`（与官方 Desktop `apps/desktop/electron/updater/system-proxy-env.ts` 同机制），Hermes 后端启动时 `hermes_cli/update_proxy_env.py:restore_user_proxy_env()`（`web_server.py:1433` 调用）按标记丢弃这批一次性变量。`ALL_PROXY` 不在官方 `_ADDED_KEYS` 内，残留指向用户常开的 SOCKS 端口，暂不处理。验证：重启桌面端后新 gateway（PID 30220）环境无任何 proxy 变量，直连 `portal.nousresearch.com` 200。`ProxyRuntime.cs` 282→**295** 行；E17 后基线 **30 文件 / 13,026 行 / 1,184 节点 / 3,259 边 / DB 3.88MB**。
+
+**E18（2026-11-07，本机 GitHub 直连不通时 DesktopUpgrade 失败）git 依赖 insteadOf 前缀截断修复**：事故日志 `DesktopUpgrade-20261107-154510.log`——repo-0/1 失败、**repo-2（gh-proxy）4360ms 获胜**，`ApplyRepoChoice` 把**整个仓库地址** `https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.git` 当 `insteadOf` 前缀登记，git 于是把 `https://github.com/` 替换成「镜像 + 仓库路径」，产出 `https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.gitNousResearch/hermes-agent.git`（psutil 变成 `…hermes-agent.gitgiampaolo/psutil.git`）→ 依赖实测与 `hermes update` 的 `git fetch origin` 全部 `repository not found`，退出码 1。为什么别的机器没事：GitHub 直连可用时 repo-0（L0）获胜 → 传 null、不注入 insteadOf，坏前缀根本没机会产生。修复：新增 `Mirrors.RepoUrlToMirrorPrefix(url)`（以 `/` 结尾原样返回，否则去掉最后两段 owner/repo.git），`NetworkPreparer.ApplyProvenGitDepsMirror` 登记前统一截断，并给 `GetGitDepsRewriteEntries` 加「前缀必须以 `/` 结尾」的防御闸（宁可本轮不改写也不指向必 404 地址）。`Mirrors.cs` 177→**213** 行、`NetworkPreparer.cs` 314→**321** 行、`InstallerEngine.cs` 1,415→**1,416** 行；E18 后基线 **30 文件 / 13,070 行 / 1,185 节点 / 3,261 边 / DB 4.06MB**。
 
 
 ```
@@ -316,8 +318,8 @@ codegraph explore "<自然语言问题>" # 一次性拉相关上下文 + 调用�
 
 索引机制备忘（照此判读，别乱「修索引」）：
 
-- 当前 `30 files / 1,177 nodes / 3,226 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`（E16 后 `codegraph sync` 复核：`Index is up to date`）。
-- 节点构成：method 387、property 190、field 217、import 160、class 62、constant 49、enum_member 44、file 30、namespace 30、enum 8。**`import`/`namespace`/`file` 三类共 220 个是结构性噪声**，估工作量时用 957 这个「真实声明数」。
+- 当前 `30 files / 1,185 nodes / 3,261 edges`，`index_state=complete`，`indexed_with_version=1.6.0`、`extraction=25`（E18 后 `codegraph sync` 复核：`Index is up to date`）。
+- 节点构成：method 393、property 190、field 218、import 160、class 62、constant 50、enum_member 44、file 30、namespace 30、enum 8。**`import`/`namespace`/`file` 三类共 220 个是结构性噪声**，估工作量时用 965 这个「真实声明数」。
 - `unresolved_refs` 恒为大量 `status='failed'`——这是 BCL/WinForms 外部符号的常态，不是索引坏了；真正的坏信号是 `project_metadata.index_state <> 'complete'`。
 - 短名符号（`Run`、`Start`、`Write`、`ToString`、属性 getter）的边可能是伪造的跨层链接：拿它当分层结论前，先 `grep` 目标命名空间是否真被 import。
 - 仓库根的 `IDEA.md` 是本地草稿（已列入 `.gitignore` 的「Local scratch」段），**不提交、不参与索引**；`git status` 应保持干净。

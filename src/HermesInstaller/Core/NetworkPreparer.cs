@@ -74,10 +74,15 @@ namespace HermesInstaller.Core
         /// <summary>
         /// E16-2：登记阶梯实测可用的 git 镜像前缀（Repo 组获胜端点的 Url）。
         /// L0（直连健康）传 null，清掉旧登记。仅本操作生效。
+        /// E18：入参是**仓库地址**（如 https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.git），
+        /// 这里统一截成前缀（…/https://github.com/）再登记。此前直接拿仓库地址当前缀，
+        /// insteadOf 会把 https://github.com/ 换成「镜像 + 仓库路径」，拼出重复仓库名的坏 URL
+        /// （2026-11-07 15:45 本机 DesktopUpgrade 失败的直接原因）。
         /// </summary>
         public void ApplyProvenGitDepsMirror(string provenUrl)
         {
-            _provenGitDepsMirror = string.IsNullOrWhiteSpace(provenUrl) ? null : provenUrl.Trim();
+            string prefix = Mirrors.RepoUrlToMirrorPrefix(provenUrl);
+            _provenGitDepsMirror = prefix;
             if (_provenGitDepsMirror != null && _logger != null)
             {
                 _logger.Info("[NET] git 依赖改写采用实测前缀（仅本操作）: " + _provenGitDepsMirror);
@@ -94,7 +99,9 @@ namespace HermesInstaller.Core
 
             int level = _planner.CurrentLevel(EndpointGroup.GitDeps);
             string mirror = _provenGitDepsMirror != null ? _provenGitDepsMirror : LevelEndpointUrl(EndpointGroup.GitDeps);
-            if (level >= 1 && !string.IsNullOrWhiteSpace(mirror))
+            // E18：只接受前缀形态（以 / 结尾）。仓库地址误当前缀会拼出重复仓库名的坏 URL，
+            // 宁可这一轮不改写（走直连）也不能把 git 依赖指向一个必 404 的地址。
+            if (level >= 1 && !string.IsNullOrWhiteSpace(mirror) && mirror.EndsWith("/", StringComparison.Ordinal))
             {
                 entries.Add(new KeyValuePair<string, string>(
                     "url." + mirror + ".insteadOf", "https://github.com/"));
