@@ -100,12 +100,16 @@ namespace HermesInstaller.Core
                 AddVersion(versions, FirstQuotedValue(
                     TryReadFile(Path.Combine(HermesPaths.InstallDir, "node_modules", "electron", "package.json")) ?? string.Empty,
                     "version", null));
-
-                if (versions.Count == 0)
-                {
-                    _logger.Warn("[PREFETCH] 未解析到任何 Electron 版本（无 package-lock / git 探测失败），跳过预热。");
-                    return "预热：未找到 Electron 版本信息，已跳过";
-                }
+                // E19-P1-3（2026-11-26 09:20:58→09:22:48 实测）：CN 镜像形态的装机
+                // （origin=cnb.cool 的 hermes-agent-cn-mirror，仓库根没有 package-lock.json、
+                // node_modules 未安装）三重来源恒空，预热整段白转。补两个本机可靠来源：
+                // apps/desktop/package.json 的 electron 依赖声明（实测 "electron": "44.10.2"），
+                // 以及已打包桌面的 win-unpacked\version（electron-builder 落盘的运行时版本）。
+                AddVersion(versions, FirstQuotedValue(
+                    TryReadFile(Path.Combine(HermesPaths.InstallDir, "apps", "desktop", "package.json")) ?? string.Empty,
+                    "electron", null));
+                AddVersion(versions, TryReadFile(
+                    Path.Combine(HermesPaths.InstallDir, "apps", "desktop", "release", "win-unpacked", "version")));
 
                 // 3) fork 预同步（E7-2，2026-10-25 08:44 升级事故回放）：hermes update
                 //    收尾时会把 upstream/main push 回 origin fork（update_cmd_git.py
@@ -113,6 +117,10 @@ namespace HermesInstaller.Core
                 //    这个推送在网络慢时可以静默挂数分钟——那次升级正是被安装器的
                 //    180s 无进展预算杀死。update 的推跳过条件 = HEAD == origin/main，
                 //    所以这里抢先把 upstream/main 推上 origin，update 的同名步骤直接跳过。
+                // E19-P0-1：这一步和下面的 builder 工具集预热都**不依赖 Electron 版本**，
+                // 因此必须先于「版本解析不出来就返回」执行。原代码把它们放在那个 return
+                // 之后，本机（三重来源皆空）100% 跳过预同步，11-26 那轮的实证后果是
+                // update 自己做 Syncing fork，静默 5分01秒后 `couldn't push to fork`。
                 var notes = new List<string>();
                 string forkNote = await PreflightForkSyncAsync(cancellationToken).ConfigureAwait(false);
                 if (!string.IsNullOrEmpty(forkNote))
@@ -120,13 +128,21 @@ namespace HermesInstaller.Core
                     notes.Add(forkNote);
                 }
 
-                foreach (string version in versions)
+                if (versions.Count == 0)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    string note = await WarmOneAsync(electronBase, version, cancellationToken).ConfigureAwait(false);
-                    if (!string.IsNullOrEmpty(note))
+                    _logger.Warn("[PREFETCH] 未解析到任何 Electron 版本（upstream/本机 package-lock、"
+                        + "apps/desktop/package.json、win-unpacked\\version 均无结果），跳过 Electron 运行时预热。");
+                }
+                else
+                {
+                    foreach (string version in versions)
                     {
-                        notes.Add(note);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        string note = await WarmOneAsync(electronBase, version, cancellationToken).ConfigureAwait(false);
+                        if (!string.IsNullOrEmpty(note))
+                        {
+                            notes.Add(note);
+                        }
                     }
                 }
 
@@ -140,7 +156,11 @@ namespace HermesInstaller.Core
 
                 if (notes.Count == 0)
                 {
-                    return "预热：Electron 运行时缓存已就绪";
+                    // E19-P0-1：版本解析不出来时不能再宣称「缓存已就绪」，
+                    // 否则日志与 UI 都在断言一件没发生过的事。
+                    return versions.Count == 0
+                        ? "预热：未解析到 Electron 版本，运行时下载已跳过（fork 预同步已执行）"
+                        : "预热：Electron 运行时缓存已就绪";
                 }
                 return "预热：" + string.Join("；", notes.ToArray());
             }
@@ -1222,6 +1242,59 @@ namespace HermesInstaller.Core
             return first.Length > 200 ? first.Substring(0, 200) + "…" : first;
         }
 
+        /// <summary>
+        /// E19-P1-4：被超时预算杀掉的进程，退出码没有信息量（git 被 TerminateProcess
+        /// 打死时通常是 1），必须把 kind/elapsed 说清楚，否则日志读起来像仓库坏了。
+        /// </summary>
+        private static string TimeoutSuffix(ProcessResult result)
+        {
+            if (result == null || !result.TimedOut)
+            {
+                return string.Empty;
+            }
+            return string.Format("，{0} 超时，最后输出距今 {1}ms",
+                string.IsNullOrEmpty(result.TimeoutKind) ? "total" : result.TimeoutKind,
+                result.LastOutputAgoMs);
+        }
+
+        /// <summary>
+        /// E19-P1-4：加了 `--progress` 之后 stderr 会夹带几百行进度，FirstLine 只能取到
+        /// "remote: Enumerating objects"这种废话。优先取最后一条 fatal/error 行，
+        /// 没有就退到最后一行非空内容（结论总在尾部）。
+        /// </summary>
+        private static string ErrorLine(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return "无 stderr";
+            }
+            string[] lines = text.Replace("\r\n", "\n").Split('\n');
+            string last = null;
+            for (int i = lines.Length - 1; i >= 0; i--)
+            {
+                string line = lines[i] == null ? string.Empty : lines[i].Trim();
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+                if (line.StartsWith("fatal", StringComparison.OrdinalIgnoreCase)
+                    || line.StartsWith("error", StringComparison.OrdinalIgnoreCase)
+                    || line.StartsWith("remote: error", StringComparison.OrdinalIgnoreCase))
+                {
+                    return line.Length > 200 ? line.Substring(0, 200) + "…" : line;
+                }
+                if (last == null)
+                {
+                    last = line;
+                }
+            }
+            if (last == null)
+            {
+                return "无 stderr";
+            }
+            return last.Length > 200 ? last.Substring(0, 200) + "…" : last;
+        }
+
         private static string TruncateText(string text, int max)
         {
             if (string.IsNullOrEmpty(text) || text.Length <= max)
@@ -1244,6 +1317,13 @@ namespace HermesInstaller.Core
                 return null;
             }
             var options = RetryPolicy.For(OperationClass.GitFetch);
+            // E19-P1-4（2026-11-26 09:20:58→09:21:59 实测）：这一路原来带 `--quiet`，
+            // 拉 2533 提交的 delta 时 stderr 全程 0 字节，被 GitFetch 的 60s 无进展预算
+            // 当成僵死杀掉，日志只剩一句「退出码 1」。改用 `--progress` 后 git 把每一步
+            // 进度各写成一行（本机实测 351 行 CRLF），每行都刷新看门狗的时间戳，
+            // 停摆与「慢但活着」才能区分开。总预算按 fork push 同口径放宽到 10 分钟
+            // （不动 RetryPolicy 的冻结表，只在调用点覆盖）。
+            options.TotalTimeout = TimeSpan.FromMinutes(10);
             // E13：git 必须用「修好的传输环境」（清死代理/换证书后端 + 镜像 insteadOf），
             // 否则这一路的失败原因只有一句退出码，排查不到真正的地雷。
             Dictionary<string, string> gitEnv = BuildGitEnvironment();
@@ -1253,12 +1333,13 @@ namespace HermesInstaller.Core
                 {
                     ProcessResult fetch = await _runner.RunProcessAsync(
                         "git.exe",
-                        "-C " + ProcessRunner.QuoteArg(repo) + " fetch --quiet --no-tags " + remote + " main",
+                        "-C " + ProcessRunner.QuoteArg(repo) + " fetch --progress --no-tags " + remote + " main",
                         repo, gitEnv, null, cancellationToken, null, options).ConfigureAwait(false);
                     if (fetch.ExitCode != 0)
                     {
-                        _logger.Info(string.Format("[PREFETCH] git fetch {0} main 失败（退出码 {1}）: {2}；换下一个来源。",
-                            remote, fetch.ExitCode, FirstLine(fetch.StandardError)));
+                        _logger.Info(string.Format("[PREFETCH] git fetch {0} main 失败（退出码 {1}{2}，耗时 {3}ms）: {4}；换下一个来源。",
+                            remote, fetch.ExitCode, TimeoutSuffix(fetch), fetch.ElapsedMs,
+                            ErrorLine(fetch.StandardError)));
                         continue;
                     }
 

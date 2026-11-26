@@ -451,7 +451,14 @@ namespace HermesInstaller
             if (result != null)
             {
                 LogLevel level = AppendVerification(result);
-                AppendLog(level, result.Message);
+                // E19-P2-6：三态结论现在由引擎侧 ConcludeResult 走 _logger.Warn/Success/Error
+                // 落盘，并经 _logger.Logged 事件（MainForm.cs:83）自动回显到这块日志框——
+                // 这里再 AppendLog 一遍就是同一行出现两次。只有不经 Logger 的结果
+                // （异常、取消、启动桌面端这类）才需要在此补 UI 行。
+                if (result.Verification == null)
+                {
+                    AppendLog(level, result.Message);
+                }
                 lblProgress.Text = result.Message;
                 MessageBoxIcon icon;
                 switch (result.Outcome)

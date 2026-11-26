@@ -24,6 +24,11 @@ namespace HermesInstaller.Core
         private static IWebProxy _previousProxy;
         private static string _lastError = string.Empty;
 
+        // E19-P2-6：收摊动作要留痕。原先 Stop() 一行日志都不写，离线读日志只能看到
+        // 「操作到 bootstrap 附录就结束了」，代理何时撤、有没有撤全都无从判断。
+        // 由 EnsureStartedAsync 记录本次操作的 Logger，Stop() 用完即清。
+        private static Logger _logger;
+
         public static bool IsActive
         {
             get
@@ -141,6 +146,7 @@ namespace HermesInstaller.Core
                 _bridge = bridge;
                 _httpProxyUrl = "http://127.0.0.1:" + bridge.Port;
                 _socksPort = tunnel.SocksPort;
+                _logger = logger;
                 _lastError = string.Empty;
             }
 
@@ -166,14 +172,20 @@ namespace HermesInstaller.Core
             {
                 return;
             }
-            int socks = SocksPort;
 
             env["HTTP_PROXY"] = http;
             env["HTTPS_PROXY"] = http;
             env["http_proxy"] = http;
             env["https_proxy"] = http;
-            env["ALL_PROXY"] = "socks5h://127.0.0.1:" + socks;
-            env["all_proxy"] = env["ALL_PROXY"];
+            // E19-P0-2：**不再注入 ALL_PROXY/all_proxy**（2026-11-26 09:43 实锤）。
+            // 官方清理只认 _ADDED_KEYS = HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy/
+            // NO_PROXY/no_proxy（hermes_cli/update_proxy_env.py:25），ALL_PROXY 不在其中，
+            // 所以标记里写上它也不会被丢弃；长驻 gateway 于是带着
+            // ALL_PROXY=socks5h://127.0.0.1:<端口> 活下去，httpx 的 trust_env 认它，
+            // 桥一停就报 `Missing dependencies for SOCKS support.`（Lark 通道连不上）。
+            // 而我们灌给子进程的本来就只有 http:// 方案（HTTP 桥），HTTP(S)_PROXY 已覆盖
+            // git/npm/pip/electron 的全部出网路径，ALL_PROXY 是纯冗余——删掉，注入集与
+            // 官方清理集对齐，不留收不回的变量。
             env["NO_PROXY"] = "localhost,127.0.0.1,::1";
             env["no_proxy"] = env["NO_PROXY"];
             env["npm_config_proxy"] = http;
@@ -190,8 +202,8 @@ namespace HermesInstaller.Core
             // 官方 Desktop 用 HERMES_UPDATE_SYSTEM_PROXY 标记同一批键，后端启动时
             // （hermes_cli/update_proxy_env.py 的 restore_user_proxy_env）会按标记丢弃；
             // 这里必须同样标记，否则升级一次就把登录弄坏一次。
-            // 注：ALL_PROXY 不在官方清理集（_ADDED_KEYS）内，它指向用户的 SOCKS 端口，
-            // 常开时残留无害；要一并清理必须同时扩充 Hermes 侧的白名单。
+            // E19-P0-2 补充：标记的键集必须是我们注入键的**超集**，注入侧每加一个代理键
+            // 都要同步考虑官方清理侧认不认——所以本块只允许出现 _ADDED_KEYS 里的变量。
             env["HERMES_UPDATE_SYSTEM_PROXY"] =
                 "HTTPS_PROXY,https_proxy,HTTP_PROXY,http_proxy,NO_PROXY,no_proxy";
         }
@@ -236,16 +248,23 @@ namespace HermesInstaller.Core
             LocalSocksHttpProxy bridge;
             SshProxyTunnel tunnel;
             IWebProxy previous;
+            Logger logger;
+            int socksPort;
+            string httpUrl;
             lock (Sync)
             {
                 bridge = _bridge;
                 tunnel = _tunnel;
                 previous = _previousProxy;
+                logger = _logger;
+                socksPort = _socksPort;
+                httpUrl = _httpProxyUrl;
                 _bridge = null;
                 _tunnel = null;
                 _httpProxyUrl = null;
                 _socksPort = 0;
                 _previousProxy = null;
+                _logger = null;
             }
 
             try
@@ -263,6 +282,15 @@ namespace HermesInstaller.Core
             {
                 try { tunnel.Dispose(); }
                 catch { }
+            }
+
+            // E19-P2-6：只在真的有过东西可撤时写这行，未启用代理的常规操作不产噪音。
+            if (logger != null && (bridge != null || tunnel != null))
+            {
+                logger.Info(string.Format(
+                    "[PROXY] 代理已收摊：HTTP 桥 {0} 与 SSH 隧道（SOCKS5 127.0.0.1:{1}）已停止，进程默认代理已恢复。",
+                    string.IsNullOrEmpty(httpUrl) ? "127.0.0.1" : httpUrl,
+                    socksPort > 0 ? socksPort.ToString() : "0"));
             }
         }
 

@@ -1086,7 +1086,7 @@ namespace HermesInstaller.Core
         /// G8 改造点 7/8 的统一收尾（流程 ⑪）：把 VerificationReport 合成三态 OperationResult。
         /// Success → Ok；Degraded → Degrade；Failed → Error。断言行已由 ResultVerifier 逐条落日志。
         /// </summary>
-        private static OperationResult ConcludeResult(VerificationReport report, string operationName, string logPath)
+        private OperationResult ConcludeResult(VerificationReport report, string operationName, string logPath)
         {
             string title = UiTextBuilder.OutcomeTitle(report.Outcome, operationName);
             string message = title + "：" + report.Summary;
@@ -1094,12 +1094,19 @@ namespace HermesInstaller.Core
             switch (report.Outcome)
             {
                 case OperationOutcome.Degraded:
+                    // E19-P2-6（2026-11-26 09:42:45 事故取证）：三态结论原先只进
+                    // OperationResult.Message → MainForm.AppendLog 是 UI-only，不经 Logger，
+                    // 所以日志文件的最后一行永远是 bootstrap 附录，离线读日志判不出成败。
+                    // 结论必须在引擎侧落盘一次，UI 弹窗只是它的第二落点。
+                    _logger.Warn(message);
                     result = OperationResult.Degrade(message, logPath);
                     break;
                 case OperationOutcome.Success:
+                    _logger.Success(message);
                     result = OperationResult.Ok(message, logPath);
                     break;
                 default:
+                    _logger.Error(message);
                     result = OperationResult.Error(message, logPath);
                     break;
             }
@@ -1220,6 +1227,9 @@ namespace HermesInstaller.Core
                 });
             }
 
+            // E19-P1-5：KillTree 之前先请后端自己停，优雅停不动再兜底杀。
+            await TryGracefulGatewayStopAsync(roots, cancellationToken).ConfigureAwait(false);
+
             var killed = new List<string>();
 
             foreach (string name in new[] { "Hermes", "hermes", "python", "pythonw" })
@@ -1280,6 +1290,141 @@ namespace HermesInstaller.Core
             {
                 _logger.Info("没有需要停止的 Hermes 进程。");
             }
+        }
+
+        /// <summary>
+        /// E19-P1-5：停进程前先走官方优雅停。
+        /// 2026-11-26 09:42:44 升级日志实证——直接 Kill 会让 gateway 记
+        /// 「Previous gateway life (pid=5096, …) exited UNCLEANLY (no exit path ran —
+        /// SIGKILL / OOM / VM death, or a process kill issued by the agent or one of its
+        /// descendants …; see #113667)」：每轮升级留一条「疑似崩溃」，还跳过了它自己的
+        /// drain 与 start attestation 清理，下次启动就把上一次当意外死亡上报。
+        /// `hermes gateway stop`（hermes_cli/gateway_windows.py:1907）的顺序是：
+        /// 撤 start attestation（注释原话「A user-initiated stop is a planned death:
+        /// don't later report it as a silent crash」）→ drain（默认 30s，上限 30s）
+        /// → schtasks /End → 自己兜底强杀。我们只借这一步，任何失败/超时都不阻塞，
+        /// 照旧落到下面的逐进程 Kill/KillTree。
+        /// 只在「本轮停的就是当前 HERMES_HOME 单根」时执行：启动器和计划任务名都绑在
+        /// HERMES_HOME 上，拿它去停别的根属于越权。
+        /// </summary>
+        private async Task TryGracefulGatewayStopAsync(IList<string> roots, CancellationToken cancellationToken)
+        {
+            if (roots == null || roots.Count != 1 || !HermesPaths.CliLauncherPresent)
+            {
+                return;
+            }
+            string selected = HermesPaths.HermesHome.TrimEnd('\\');
+            if (!string.Equals(roots[0], selected, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            if (!HermesProcessPresent(roots))
+            {
+                return;
+            }
+
+            // 预算：优雅停自己的 drain 上限是 30s，加上 python 冷启动，给 60s 总计；
+            // 不监控无进展（它在等 drain 期间本来就少输出）。不改 RetryPolicy 的参数表。
+            var options = new ProcessRunOptions
+            {
+                Class = OperationClass.Generic,
+                NoProgressTimeout = null,
+                TotalTimeout = TimeSpan.FromSeconds(60),
+                PollIntervalMs = 500
+            };
+
+            try
+            {
+                var tail = new List<string>();
+                ProcessResult result = await _runner.RunPowerShellAsync(
+                    "& " + ProcessRunner.Quote(HermesPaths.HermesCmd) + " gateway stop",
+                    HermesPaths.HermesHome,
+                    _network.BuildEnvironment(),
+                    (line, level) =>
+                    {
+                        if (tail.Count < 8 && !string.IsNullOrWhiteSpace(line))
+                        {
+                            tail.Add(line.Trim());
+                        }
+                    },
+                    cancellationToken,
+                    options).ConfigureAwait(false);
+
+                string summary = tail.Count > 0 ? string.Join(" / ", tail.ToArray()) : "无输出";
+                if (result.Cancelled)
+                {
+                    _logger.Warn("[STOP] 优雅停止网关被取消，回落直接杀进程: " + summary);
+                }
+                else if (result.TimedOut)
+                {
+                    _logger.Warn(string.Format(
+                        "[STOP] 优雅停止网关超时（{0}，{1}ms），回落直接杀进程: {2}",
+                        string.IsNullOrEmpty(result.TimeoutKind) ? "total" : result.TimeoutKind,
+                        result.ElapsedMs, summary));
+                }
+                else if (result.ExitCode != 0)
+                {
+                    _logger.Warn(string.Format(
+                        "[STOP] 优雅停止网关退出码 {0}（{1}ms），回落直接杀进程: {2}",
+                        result.ExitCode, result.ElapsedMs, summary));
+                }
+                else
+                {
+                    _logger.Info(string.Format(
+                        "[STOP] 已优雅停止网关（{0}ms），残留进程随后兜底清理: {1}",
+                        result.ElapsedMs, summary));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("[STOP] 优雅停止网关调用失败，回落直接杀进程: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// E19-P1-5：归属判定——roots 下是否还有在跑的 Hermes 侧进程（与停杀循环同口径：
+        /// 进程名 + MainModule 路径前缀，跳过自身）。只用来决定要不要走优雅停，避免
+        /// 「本来没进程」时白等一次 python 冷启动。
+        /// </summary>
+        private bool HermesProcessPresent(IList<string> roots)
+        {
+            int self = Process.GetCurrentProcess().Id;
+            foreach (string name in new[] { "Hermes", "hermes", "python", "pythonw" })
+            {
+                foreach (Process process in Process.GetProcessesByName(name))
+                {
+                    try
+                    {
+                        if (process.Id == self)
+                        {
+                            continue;
+                        }
+                        string path = null;
+                        try { path = process.MainModule != null ? process.MainModule.FileName : null; } catch { }
+                        if (path == null)
+                        {
+                            continue;
+                        }
+                        foreach (string root in roots)
+                        {
+                            if (path.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { process.Dispose(); } catch { }
+                    }
+                }
+            }
+            return false;
         }
 
         public void LaunchCli()
